@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import { properties, PropertyConfig } from './config';
-import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, Reservation } from './hostaway';
+import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, Reservation, PoolHeatResult } from './hostaway';
 import { getPoolStatus, setPoolHeat, turnOffPoolHeat } from './screenlogic';
 import { calculateHeaterStartTime } from './weather';
 import { alertHeaterAction, alertManualReminder, sendAlert } from './alerts';
@@ -25,21 +25,62 @@ function getPropertyForListing(listingId: number): PropertyConfig | undefined {
 
 /**
  * Check if a reservation qualifies for pool heat by scanning messages.
- * Looks for Brady's pool heat offer (keyed on "gallons of propane") and guest agreement.
+ * Returns the scan result with status and heat days.
  */
-async function reservationNeedsHeat(reservation: Reservation): Promise<boolean> {
+async function checkReservationHeat(reservation: Reservation): Promise<PoolHeatResult> {
   const messages = await getConversationMessages(reservation.id);
   if (messages.length > 0) {
-    const status = scanMessagesForPoolHeat(messages);
-    return status === 'agreed';
+    return scanMessagesForPoolHeat(messages);
   }
-  return false;
+  return { status: 'not_discussed', heatDays: null };
+}
+
+/**
+ * Calculate the heater OFF time.
+ * - If heatDays is null (full stay): 8 PM on departure date
+ * - If heatDays is a number: 8 PM on (arrival + heatDays) days
+ *
+ * The heater turns off at 8 PM on the last paid heat day, not at checkout.
+ */
+function calculateHeaterOffTime(
+  arrivalDate: string,
+  departureDate: string,
+  heatDays: number | null,
+  timezone: string
+): Date {
+  let lastHeatDate: string;
+
+  if (heatDays === null) {
+    // Full stay — last heat day is the day before departure (guest's last night)
+    const dep = new Date(departureDate + 'T00:00:00');
+    dep.setDate(dep.getDate() - 1);
+    lastHeatDate = dep.toISOString().split('T')[0];
+  } else {
+    // Partial stay — heat for N days starting from arrival
+    const arr = new Date(arrivalDate + 'T00:00:00');
+    arr.setDate(arr.getDate() + heatDays - 1);
+    // Don't go past departure
+    const dep = new Date(departureDate + 'T00:00:00');
+    dep.setDate(dep.getDate() - 1);
+    if (arr > dep) {
+      lastHeatDate = dep.toISOString().split('T')[0];
+    } else {
+      lastHeatDate = arr.toISOString().split('T')[0];
+    }
+  }
+
+  // 8 PM on the last heat day
+  return new Date(`${lastHeatDate}T20:00:00`);
 }
 
 /**
  * Schedule heater on/off events for a reservation.
  */
-async function scheduleForReservation(reservation: Reservation, property: PropertyConfig) {
+async function scheduleForReservation(
+  reservation: Reservation,
+  property: PropertyConfig,
+  heatResult: PoolHeatResult
+) {
   // Check if already scheduled
   const existing = scheduledEvents.find(
     e => e.reservationId === reservation.id && !e.executed
@@ -48,13 +89,24 @@ async function scheduleForReservation(reservation: Reservation, property: Proper
 
   // Build check-in datetime
   const checkIn = new Date(`${reservation.arrivalDate}T${String(property.checkInHour).padStart(2, '0')}:00:00`);
-  const checkOut = new Date(`${reservation.departureDate}T${String(property.checkOutHour).padStart(2, '0')}:00:00`);
 
-  // Use season-based target temp (from pricing table) instead of static config
+  // Use season-based target temp from pricing table
   const targetTemp = getTargetTempForDate(checkIn);
 
+  // Calculate heater OFF: 8 PM on last paid heat day
+  const heaterOffTime = calculateHeaterOffTime(
+    reservation.arrivalDate,
+    reservation.departureDate,
+    heatResult.heatDays,
+    property.timezone
+  );
+
+  const heatDaysLabel = heatResult.heatDays === null
+    ? 'full stay'
+    : `${heatResult.heatDays} day${heatResult.heatDays > 1 ? 's' : ''}`;
+
   if (property.poolSystem === 'screenlogic' && property.screenlogicGateway) {
-    // Smart scheduling: calculate optimal start time
+    // Smart scheduling: calculate optimal start time based on pool temp + weather
     let currentPoolTemp: number | null = null;
     try {
       const status = await getPoolStatus(property.screenlogicGateway);
@@ -71,7 +123,7 @@ async function scheduleForReservation(reservation: Reservation, property: Proper
       property.longitude
     );
 
-    // Schedule heater ON
+    // Schedule heater ON (smart-timed to reach target by check-in)
     scheduledEvents.push({
       reservationId: reservation.id,
       propertyName: property.name,
@@ -79,28 +131,50 @@ async function scheduleForReservation(reservation: Reservation, property: Proper
       scheduledTime: startTime,
       guestName: reservation.guestName,
       executed: false,
-      targetTemp: targetTemp,
+      targetTemp,
     });
 
-    // Schedule heater OFF at checkout
+    // Schedule heater OFF at 8 PM on last paid heat day
     scheduledEvents.push({
       reservationId: reservation.id,
       propertyName: property.name,
       action: 'OFF',
-      scheduledTime: checkOut,
+      scheduledTime: heaterOffTime,
       guestName: reservation.guestName,
       executed: false,
-      targetTemp: targetTemp,
+      targetTemp,
     });
 
     await sendAlert('info',
       `Heat scheduled — ${property.name}`,
-      `Guest: ${reservation.guestName}\nCheck-in: ${checkIn.toISOString()}\nHeater ON: ${startTime.toISOString()} (${estimatedHours}h to heat)\nHeater OFF: ${checkOut.toISOString()}\nTarget: ${targetTemp}°F\nAvg air temp forecast: ${avgAirTemp.toFixed(1)}°F\nCurrent pool temp: ${currentPoolTemp ?? 'unknown'}°F`
+      [
+        `Guest: ${reservation.guestName}`,
+        `Stay: ${reservation.arrivalDate} → ${reservation.departureDate}`,
+        `Heat duration: ${heatDaysLabel}`,
+        `Target: ${targetTemp}°F`,
+        `Current pool temp: ${currentPoolTemp ?? 'unknown'}°F`,
+        `Avg air temp forecast: ${avgAirTemp.toFixed(1)}°F`,
+        `Heater ON: ${startTime.toLocaleString('en-US', { timeZone: property.timezone })} (${estimatedHours}h to heat)`,
+        `Heater OFF: ${heaterOffTime.toLocaleString('en-US', { timeZone: property.timezone })}`,
+      ].join('\n')
     );
   } else {
     // IntelliConnect — schedule reminders only
-    // 24h before check-in reminder
-    const reminderTime = new Date(checkIn.getTime() - 24 * 60 * 60 * 1000);
+    // Smart reminder: same timing logic but manual action
+    let reminderTime: Date;
+    try {
+      const { startTime } = await calculateHeaterStartTime(
+        checkIn,
+        targetTemp,
+        null, // Can't read IntelliConnect pool temp
+        property.latitude,
+        property.longitude
+      );
+      reminderTime = startTime;
+    } catch {
+      // Fallback: 24h before check-in
+      reminderTime = new Date(checkIn.getTime() - 24 * 60 * 60 * 1000);
+    }
 
     scheduledEvents.push({
       reservationId: reservation.id,
@@ -109,22 +183,30 @@ async function scheduleForReservation(reservation: Reservation, property: Proper
       scheduledTime: reminderTime,
       guestName: reservation.guestName,
       executed: false,
-      targetTemp: targetTemp,
+      targetTemp,
     });
 
     scheduledEvents.push({
       reservationId: reservation.id,
       propertyName: property.name,
       action: 'OFF',
-      scheduledTime: checkOut,
+      scheduledTime: heaterOffTime,
       guestName: reservation.guestName,
       executed: false,
-      targetTemp: targetTemp,
+      targetTemp,
     });
 
     await sendAlert('info',
       `Heat reminders set — ${property.name} (manual)`,
-      `Guest: ${reservation.guestName}\nReminder ON: ${reminderTime.toISOString()}\nReminder OFF: ${checkOut.toISOString()}\nThis is an IntelliConnect pool — you'll need to turn heat on/off manually.`
+      [
+        `Guest: ${reservation.guestName}`,
+        `Stay: ${reservation.arrivalDate} → ${reservation.departureDate}`,
+        `Heat duration: ${heatDaysLabel}`,
+        `Target: ${targetTemp}°F`,
+        `Reminder ON: ${reminderTime.toLocaleString('en-US', { timeZone: property.timezone })}`,
+        `Reminder OFF: ${heaterOffTime.toLocaleString('en-US', { timeZone: property.timezone })}`,
+        `This is an IntelliConnect pool — manual action required.`,
+      ].join('\n')
     );
   }
 }
@@ -204,15 +286,16 @@ export async function scanReservations() {
   console.log(`[${new Date().toISOString()}] Scanning reservations...`);
 
   try {
-    const reservations = await getAllUpcomingReservations();
+    const listingIds = properties.map(p => p.hostawayListingId);
+    const reservations = await getAllUpcomingReservations(listingIds);
 
     for (const res of reservations) {
       const property = getPropertyForListing(res.listingMapId);
       if (!property) continue;
 
-      const needsHeat = await reservationNeedsHeat(res);
-      if (needsHeat) {
-        await scheduleForReservation(res, property);
+      const heatResult = await checkReservationHeat(res);
+      if (heatResult.status === 'agreed') {
+        await scheduleForReservation(res, property, heatResult);
       }
     }
 
@@ -230,9 +313,9 @@ export async function handleReservationWebhook(reservation: Reservation) {
   const property = getPropertyForListing(reservation.listingMapId);
   if (!property) return;
 
-  const needsHeat = await reservationNeedsHeat(reservation);
-  if (needsHeat) {
-    await scheduleForReservation(reservation, property);
+  const heatResult = await checkReservationHeat(reservation);
+  if (heatResult.status === 'agreed') {
+    await scheduleForReservation(reservation, property, heatResult);
   }
 }
 

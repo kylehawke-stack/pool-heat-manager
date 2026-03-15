@@ -53,6 +53,8 @@ export async function getPoolStatus(gatewayName: string, password?: string): Pro
 
 /**
  * Set the pool heater target temperature and turn on heating.
+ * If the heater is already on (e.g. manually turned on), it stays on
+ * and we just update the set point if needed.
  */
 export async function setPoolHeat(
   gatewayName: string,
@@ -63,26 +65,42 @@ export async function setPoolHeat(
     const client = await connectRemote(gatewayName, password);
 
     try {
+      // Check current state first
+      const currentState = await client.equipment.getEquipmentStateAsync();
+      const poolBody = currentState.bodies.find(b => b.id === BodyIndex.POOL) ?? currentState.bodies[0];
+      const alreadyHeating = (poolBody?.heatStatus ?? 0) > 0;
+      const currentSetPoint = poolBody?.setPoint ?? 0;
+
+      if (alreadyHeating && currentSetPoint === targetTemp) {
+        // Already on at the right temp — leave it alone
+        await client.closeAsync();
+        return {
+          success: true,
+          message: `Heater already ON at ${targetTemp}°F — no changes needed. Pool temp: ${poolBody?.currentTemp ?? 'unknown'}°F`,
+        };
+      }
+
       // Set target temp and heat mode for pool body
       await client.bodies.setSetPointAsync(BodyIndex.POOL, targetTemp);
       await client.bodies.setHeatModeAsync(BodyIndex.POOL, HeatModes.HEAT_MODE_HEATER);
 
       // Verify by reading state back
-      const state = await client.equipment.getEquipmentStateAsync();
-      const poolBody = state.bodies.find(b => b.id === BodyIndex.POOL) ?? state.bodies[0];
+      const verifyState = await client.equipment.getEquipmentStateAsync();
+      const verifyBody = verifyState.bodies.find(b => b.id === BodyIndex.POOL) ?? verifyState.bodies[0];
 
-      const currentSetPoint = poolBody?.setPoint ?? 0;
-      const currentHeatMode = poolBody?.heatMode ?? 0;
+      const verifySetPoint = verifyBody?.setPoint ?? 0;
+      const verifyHeatMode = verifyBody?.heatMode ?? 0;
 
-      if (currentSetPoint === targetTemp && currentHeatMode === HeatModes.HEAT_MODE_HEATER) {
+      if (verifySetPoint === targetTemp && verifyHeatMode === HeatModes.HEAT_MODE_HEATER) {
+        const prefix = alreadyHeating ? 'Heater was already running — updated' : 'Heater ON';
         return {
           success: true,
-          message: `Heater ON — target ${targetTemp}°F, mode HEATER. Current pool temp: ${poolBody?.currentTemp ?? 'unknown'}°F`,
+          message: `${prefix} — target ${targetTemp}°F, mode HEATER. Current pool temp: ${verifyBody?.currentTemp ?? 'unknown'}°F`,
         };
       } else {
         return {
           success: false,
-          message: `Commands sent but verification failed. SetPoint: ${currentSetPoint} (expected ${targetTemp}), Mode: ${currentHeatMode} (expected ${HeatModes.HEAT_MODE_HEATER})`,
+          message: `Commands sent but verification failed. SetPoint: ${verifySetPoint} (expected ${targetTemp}), Mode: ${verifyHeatMode} (expected ${HeatModes.HEAT_MODE_HEATER})`,
         };
       }
     } finally {

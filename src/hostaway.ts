@@ -61,30 +61,22 @@ export interface Reservation {
 }
 
 /**
- * Get upcoming reservations for a specific listing
+ * Get all upcoming reservations across all listings.
+ * Filters client-side by listingMapId since the Hostaway API filter is unreliable.
  */
-export async function getUpcomingReservations(listingId: number): Promise<Reservation[]> {
+export async function getAllUpcomingReservations(listingIds: number[]): Promise<Reservation[]> {
   const today = new Date().toISOString().split('T')[0];
   const result = await hostawayGet('/reservations', {
-    listingMapId: String(listingId),
-    arrivalDateStart: today,
+    arrivalStartDate: today,
     sortOrder: 'arrivalDate',
-    limit: '50',
+    limit: '200',
   });
-  return result || [];
-}
 
-/**
- * Get all upcoming reservations across all listings
- */
-export async function getAllUpcomingReservations(): Promise<Reservation[]> {
-  const today = new Date().toISOString().split('T')[0];
-  const result = await hostawayGet('/reservations', {
-    arrivalDateStart: today,
-    sortOrder: 'arrivalDate',
-    limit: '100',
-  });
-  return result || [];
+  // Client-side filter: only confirmed reservations for our pool properties
+  // "modified" = confirmed booking. Exclude inquiry, cancelled, ownerStay, etc.
+  return (result || []).filter((r: Reservation) =>
+    listingIds.includes(r.listingMapId) && r.status === 'modified'
+  );
 }
 
 /**
@@ -112,33 +104,101 @@ export async function getConversationMessages(reservationId: number): Promise<an
   }
 }
 
-// Phrases from Brady's pool heat offer email that uniquely identify it.
-// "gallons of propane" is the strongest signal — no other message would say this.
+// "gallons of propane" is the primary signal — uniquely identifies Brady's pool heat offer.
 const OFFER_KEYWORDS = [
   'gallons of propane',
-  'heat the pool for you',
-  'pool heat',
-  '$150 per day',
-  '$125 per day',
-  '$95 per day',
-  '[pool heat offer]', // optional explicit tag Brady can add
+  '[pool heat offer]',
 ];
 
+const POSITIVE_SIGNALS = [
+  'yes', 'please', 'sounds good', 'go ahead', 'sure', 'absolutely',
+  'that would be great', 'love that', "let's do it", 'we want', 'i want',
+  'definitely', 'perfect', "we'd like", "i'd like", 'we would like',
+  'would love', "we'll take", "i'll take", 'sign us up', 'count us in',
+  'go for it', 'add it', 'add the heat', 'add pool heat', 'want the heat',
+  'want pool heat', 'like to heat', 'like the pool heated', 'pool heated',
+  'no problem', "that's fair",
+];
+
+const NEGATIVE_SIGNALS = [
+  'no thanks', 'no thank', "don't need", 'do not need', 'not necessary',
+  'pass on', 'skip the heat', 'decline', "won't need", 'will not need',
+  'not interested', 'no pool heat', "don't want", 'do not want',
+  'too expensive', 'not worth', "we'll pass", "i'll pass", 'no heat',
+  'without heat', 'not this time',
+];
+
+export interface PoolHeatResult {
+  status: 'agreed' | 'declined' | 'pending' | 'not_discussed';
+  /** Number of days of heat requested. null = full stay, number = partial. */
+  heatDays: number | null;
+}
+
 /**
- * Scan a conversation for pool heat status.
+ * Parse number of heat days from guest messages after the offer.
+ * Only checks GUEST responses — ignores host messages (which contain
+ * "two day minimum" in the offer template that would false-match).
+ *
+ * Looks for patterns like "2 days", "3 nights", "just the first 2 days", "only 3 days".
+ * Returns null for full stay ("the week", "whole stay", or no specific count mentioned).
+ */
+function parseHeatDays(messages: any[], offerIndex: number): number | null {
+  // Only look at guest messages after the offer
+  const guestResponsesAfterOffer = messages.slice(offerIndex + 1).filter(
+    (m: any) => m.isIncoming === 1 || m.senderType === 'guest'
+  );
+
+  for (const msg of guestResponsesAfterOffer) {
+    const body = (msg.body || '').toLowerCase();
+
+    // Full stay indicators
+    if (/\b(the week|full week|whole stay|whole week|all \d+ days|entire stay|for the week)\b/.test(body)) {
+      return null; // Full stay
+    }
+
+    // Specific day count: "2 days", "3 nights", "just 2 days", "only 3 days"
+    const dayMatch = body.match(/\b(?:just|only)?\s*(\d+)\s*(?:days?|nights?)\b/);
+    if (dayMatch) {
+      const days = parseInt(dayMatch[1], 10);
+      if (days >= 1 && days <= 14) return days;
+    }
+
+    // Word-number patterns: "two days", "three nights"
+    const wordNums: Record<string, number> = {
+      'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+      'six': 6, 'seven': 7,
+    };
+    const wordMatch = body.match(/\b(one|two|three|four|five|six|seven)\s+(?:days?|nights?)\b/);
+    if (wordMatch && wordNums[wordMatch[1]]) {
+      return wordNums[wordMatch[1]];
+    }
+  }
+
+  return null; // Default: full stay
+}
+
+/**
+ * Scan a conversation for pool heat status and duration.
  *
  * Logic:
- * 1. Find outbound (host) messages containing pool heat offer keywords
- * 2. If found, look for the guest's response after the offer
- * 3. Classify response as agreed / declined / pending / not_discussed
+ * 1. Find outbound (host) messages containing "gallons of propane" (the offer)
+ * 2. Look for guest response after the offer
+ * 3. Classify as agreed/declined/pending
+ * 4. If agreed, parse how many days of heat they want
  */
-export function scanMessagesForPoolHeat(
-  messages: any[]
-): 'agreed' | 'declined' | 'pending' | 'not_discussed' {
-  // Sort messages by date ascending
-  const sorted = [...messages].sort(
-    (a, b) => new Date(a.insertedOn || a.createdAt).getTime() - new Date(b.insertedOn || b.createdAt).getTime()
-  );
+export function scanMessagesForPoolHeat(messages: any[]): PoolHeatResult {
+  // Use API return order (chronological). Sorting by insertedOn is unreliable
+  // because bulk-imported conversations can have identical timestamps.
+  // Fall back to ID ascending only if timestamps differ meaningfully.
+  const sorted = [...messages];
+  const timestamps = sorted.map(m => new Date(m.insertedOn || m.createdAt || 0).getTime());
+  const allSameTimestamp = timestamps.every(t => Math.abs(t - timestamps[0]) < 5000);
+  if (!allSameTimestamp) {
+    sorted.sort((a, b) =>
+      new Date(a.insertedOn || a.createdAt).getTime() - new Date(b.insertedOn || b.createdAt).getTime()
+    );
+  }
+  // If all timestamps are within 5 seconds, trust the API's return order
 
   let hostOfferedHeat = false;
   let lastOfferIndex = -1;
@@ -154,38 +214,26 @@ export function scanMessagesForPoolHeat(
     }
   }
 
-  if (!hostOfferedHeat) return 'not_discussed';
+  if (!hostOfferedHeat) return { status: 'not_discussed', heatDays: null };
 
   // Look for guest responses after the pool heat offer
   const responsesAfter = sorted.slice(lastOfferIndex + 1).filter(
     m => m.isIncoming === 1 || m.senderType === 'guest'
   );
 
-  if (responsesAfter.length === 0) return 'pending';
-
-  // Check the first guest response(s) for agreement/disagreement
-  const positiveSignals = [
-    'yes', 'please', 'sounds good', 'go ahead', 'sure', 'absolutely',
-    'that would be great', 'love that', "let's do it", 'we want', 'i want',
-    'definitely', 'perfect', "we'd like", "i'd like", 'we would like',
-    'would love', 'we\'ll take', 'i\'ll take', 'sign us up', 'count us in',
-    'go for it', 'add it', 'add the heat', 'add pool heat', 'want the heat',
-    'want pool heat', 'like to heat', 'like the pool heated',
-  ];
-  const negativeSignals = [
-    'no thanks', 'no thank', "don't need", 'do not need', 'not necessary',
-    'pass on', 'skip', 'decline', "won't need", 'will not need',
-    'not interested', 'no pool heat', "don't want", 'do not want',
-    'too expensive', 'not worth', "we'll pass", "i'll pass", 'no heat',
-    'without heat', 'not this time',
-  ];
+  if (responsesAfter.length === 0) return { status: 'pending', heatDays: null };
 
   for (const resp of responsesAfter) {
     const body = (resp.body || '').toLowerCase();
-    if (negativeSignals.some(kw => body.includes(kw))) return 'declined';
-    if (positiveSignals.some(kw => body.includes(kw))) return 'agreed';
+    if (NEGATIVE_SIGNALS.some(kw => body.includes(kw))) {
+      return { status: 'declined', heatDays: null };
+    }
+    if (POSITIVE_SIGNALS.some(kw => body.includes(kw))) {
+      const heatDays = parseHeatDays(sorted, lastOfferIndex);
+      return { status: 'agreed', heatDays };
+    }
   }
 
-  // Guest responded but couldn't classify — treat as pending (needs manual review)
-  return 'pending';
+  // Guest responded but couldn't classify
+  return { status: 'pending', heatDays: null };
 }
