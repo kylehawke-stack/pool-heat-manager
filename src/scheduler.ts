@@ -4,7 +4,7 @@ import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoo
 import { getPoolStatus, setPoolHeat, turnOffPoolHeat } from './screenlogic';
 import { calculateHeaterStartTime } from './weather';
 import { alertHeaterAction, alertManualReminder, sendAlert } from './alerts';
-import { getTargetTempForDate } from './pricing';
+import { getTargetTempForStay } from './pricing';
 
 interface ScheduledEvent {
   reservationId: number;
@@ -90,8 +90,9 @@ async function scheduleForReservation(
   // Build check-in datetime
   const checkIn = new Date(`${reservation.arrivalDate}T${String(property.checkInHour).padStart(2, '0')}:00:00`);
 
-  // Use season-based target temp from pricing table
-  const targetTemp = getTargetTempForDate(checkIn);
+  // Use season-based target temp — majority month of the stay, not just arrival date
+  // e.g. March 31 check-in with April stay = 80°F (April rate)
+  const targetTemp = getTargetTempForStay(reservation.arrivalDate, reservation.departureDate);
 
   // Calculate heater OFF: 8 PM on last paid heat day
   const heaterOffTime = calculateHeaterOffTime(

@@ -118,6 +118,10 @@ const POSITIVE_SIGNALS = [
   'go for it', 'add it', 'add the heat', 'add pool heat', 'want the heat',
   'want pool heat', 'like to heat', 'like the pool heated', 'pool heated',
   'no problem', "that's fair",
+  'ok with', 'okay with', 'fine with', // "we are ok with the heating charge"
+  'looks good', 'pricing breakdown', 'payment has been sent',
+  'love for the pool', 'would love for the pool',
+  'if it\'s heated', // "if it's heated first thing Friday"
 ];
 
 const NEGATIVE_SIGNALS = [
@@ -154,6 +158,26 @@ function parseHeatDays(messages: any[], offerIndex: number): number | null {
     // Full stay indicators
     if (/\b(the week|full week|whole stay|whole week|all \d+ days|entire stay|for the week)\b/.test(body)) {
       return null; // Full stay
+    }
+
+    // Day-of-week counting: "Friday and Saturday" = 2 days, "Wed to Fri" = 3 days
+    const dayNames = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+                       'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+    const dayAbbrevToNum: Record<string, number> = {
+      'monday': 1, 'mon': 1, 'tuesday': 2, 'tue': 2, 'wednesday': 3, 'wed': 3,
+      'thursday': 4, 'thu': 4, 'friday': 5, 'fri': 5, 'saturday': 6, 'sat': 6, 'sunday': 7, 'sun': 7,
+    };
+    // "X and Y" pattern: "Friday and Saturday" = 2 days
+    // Allow optional words between connector and second day name (e.g. "friday and all saturday")
+    const andPattern = new RegExp(`\\b(${dayNames.join('|')})\\s+(?:and|&|through|thru|to)\\s+(?:\\w+\\s+)?(${dayNames.join('|')})\\b`);
+    const andMatch = body.match(andPattern);
+    if (andMatch) {
+      const from = dayAbbrevToNum[andMatch[1]];
+      const to = dayAbbrevToNum[andMatch[2]];
+      if (from && to) {
+        const span = to >= from ? to - from + 1 : 7 - from + to + 1;
+        if (span >= 1 && span <= 7) return span;
+      }
     }
 
     // Specific day count: "2 days", "3 nights", "just 2 days", "only 3 days"
