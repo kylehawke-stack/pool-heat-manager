@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import { properties, PropertyConfig } from './config';
-import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, Reservation, PoolHeatResult } from './hostaway';
+import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, getReservation, Reservation, PoolHeatResult } from './hostaway';
 import { getPoolStatus, setPoolHeat, turnOffPoolHeat } from './screenlogic';
 import { calculateHeaterStartTime } from './weather';
 import { alertHeaterAction, alertManualReminder, sendAlert } from './alerts';
@@ -9,11 +9,12 @@ import { getTargetTempForStay } from './pricing';
 interface ScheduledEvent {
   reservationId: number;
   propertyName: string;
-  action: 'ON' | 'OFF';
+  action: 'ON' | 'OFF' | 'RECALCULATE';
   scheduledTime: Date;
   guestName: string;
   executed: boolean;
   targetTemp: number;
+  heatDays?: number | null;
 }
 
 // In-memory schedule (persisted to disk would be better for production)
@@ -106,36 +107,29 @@ async function scheduleForReservation(
     ? 'full stay'
     : `${heatResult.heatDays} day${heatResult.heatDays > 1 ? 's' : ''}`;
 
-  if (property.poolSystem === 'screenlogic' && property.screenlogicGateway) {
-    // Smart scheduling: calculate optimal start time based on pool temp + weather
-    let currentPoolTemp: number | null = null;
-    try {
-      const status = await getPoolStatus(property.screenlogicGateway);
-      currentPoolTemp = status.poolTemp;
-    } catch {
-      // Can't read temp — will estimate from air temp
-    }
+  const now = new Date();
+  const hoursUntilCheckIn = (checkIn.getTime() - now.getTime()) / (1000 * 60 * 60);
 
-    const { startTime, estimatedHours, avgAirTemp } = await calculateHeaterStartTime(
-      checkIn,
-      targetTemp,
-      currentPoolTemp,
-      property.latitude,
-      property.longitude
-    );
+  if (hoursUntilCheckIn <= 72) {
+    // Check-in is within 72 hours — calculate smart timing NOW
+    await scheduleSmartTiming(reservation, property, targetTemp, checkIn, heaterOffTime, heatDaysLabel);
+  } else {
+    // Check-in is far away — schedule a RECALCULATE event for 72h before check-in.
+    // No pool temp reads, no weather API calls. Just note the agreement.
+    const recalcTime = new Date(checkIn.getTime() - 72 * 60 * 60 * 1000);
 
-    // Schedule heater ON (smart-timed to reach target by check-in)
     scheduledEvents.push({
       reservationId: reservation.id,
       propertyName: property.name,
-      action: 'ON',
-      scheduledTime: startTime,
+      action: 'RECALCULATE',
+      scheduledTime: recalcTime,
       guestName: reservation.guestName,
       executed: false,
       targetTemp,
+      heatDays: heatResult.heatDays,
     });
 
-    // Schedule heater OFF at 8 PM on last paid heat day
+    // Always schedule heater OFF now (doesn't need smart timing)
     scheduledEvents.push({
       reservationId: reservation.id,
       propertyName: property.name,
@@ -146,8 +140,74 @@ async function scheduleForReservation(
       targetTemp,
     });
 
+    const autoLabel = property.poolSystem === 'screenlogic' ? 'auto' : 'reminder';
     await sendAlert('info',
-      `Heat scheduled — ${property.name}`,
+      `Heat confirmed — ${property.name} (${autoLabel})`,
+      [
+        `Guest: ${reservation.guestName}`,
+        `Stay: ${reservation.arrivalDate} → ${reservation.departureDate}`,
+        `Heat duration: ${heatDaysLabel}`,
+        `Target: ${targetTemp}°F`,
+        `Heater OFF: ${heaterOffTime.toLocaleString('en-US', { timeZone: property.timezone })}`,
+        `Smart timing will be calculated ${recalcTime.toLocaleString('en-US', { timeZone: property.timezone })} (72h before check-in).`,
+      ].join('\n')
+    );
+  }
+}
+
+/**
+ * Smart timing: read pool temp + weather forecast, schedule ON event.
+ * Only called when check-in is within 72 hours.
+ */
+async function scheduleSmartTiming(
+  reservation: Reservation,
+  property: PropertyConfig,
+  targetTemp: number,
+  checkIn: Date,
+  heaterOffTime: Date,
+  heatDaysLabel: string
+) {
+  if (property.poolSystem === 'screenlogic' && property.screenlogicGateway) {
+    let currentPoolTemp: number | null = null;
+    try {
+      const status = await getPoolStatus(property.screenlogicGateway);
+      currentPoolTemp = status.poolTemp;
+    } catch {
+      // Can't read temp — will estimate from air temp
+    }
+
+    const { startTime, estimatedHours, avgAirTemp } = await calculateHeaterStartTime(
+      checkIn, targetTemp, currentPoolTemp, property.latitude, property.longitude
+    );
+
+    scheduledEvents.push({
+      reservationId: reservation.id,
+      propertyName: property.name,
+      action: 'ON',
+      scheduledTime: startTime,
+      guestName: reservation.guestName,
+      executed: false,
+      targetTemp,
+    });
+
+    // Only add OFF if not already scheduled
+    const hasOff = scheduledEvents.some(
+      e => e.reservationId === reservation.id && e.action === 'OFF' && !e.executed
+    );
+    if (!hasOff) {
+      scheduledEvents.push({
+        reservationId: reservation.id,
+        propertyName: property.name,
+        action: 'OFF',
+        scheduledTime: heaterOffTime,
+        guestName: reservation.guestName,
+        executed: false,
+        targetTemp,
+      });
+    }
+
+    await sendAlert('info',
+      `Heat smart-timed — ${property.name}`,
       [
         `Guest: ${reservation.guestName}`,
         `Stay: ${reservation.arrivalDate} → ${reservation.departureDate}`,
@@ -160,20 +220,14 @@ async function scheduleForReservation(
       ].join('\n')
     );
   } else {
-    // IntelliConnect — schedule reminders only
-    // Smart reminder: same timing logic but manual action
+    // IntelliConnect — smart reminder timing
     let reminderTime: Date;
     try {
       const { startTime } = await calculateHeaterStartTime(
-        checkIn,
-        targetTemp,
-        null, // Can't read IntelliConnect pool temp
-        property.latitude,
-        property.longitude
+        checkIn, targetTemp, null, property.latitude, property.longitude
       );
       reminderTime = startTime;
     } catch {
-      // Fallback: 24h before check-in
       reminderTime = new Date(checkIn.getTime() - 24 * 60 * 60 * 1000);
     }
 
@@ -187,18 +241,23 @@ async function scheduleForReservation(
       targetTemp,
     });
 
-    scheduledEvents.push({
-      reservationId: reservation.id,
-      propertyName: property.name,
-      action: 'OFF',
-      scheduledTime: heaterOffTime,
-      guestName: reservation.guestName,
-      executed: false,
-      targetTemp,
-    });
+    const hasOff = scheduledEvents.some(
+      e => e.reservationId === reservation.id && e.action === 'OFF' && !e.executed
+    );
+    if (!hasOff) {
+      scheduledEvents.push({
+        reservationId: reservation.id,
+        propertyName: property.name,
+        action: 'OFF',
+        scheduledTime: heaterOffTime,
+        guestName: reservation.guestName,
+        executed: false,
+        targetTemp,
+      });
+    }
 
     await sendAlert('info',
-      `Heat reminders set — ${property.name} (manual)`,
+      `Heat reminder timed — ${property.name} (manual)`,
       [
         `Guest: ${reservation.guestName}`,
         `Stay: ${reservation.arrivalDate} → ${reservation.departureDate}`,
@@ -230,11 +289,33 @@ async function executeScheduledEvents() {
       continue;
     }
 
+    // RECALCULATE: 72h before check-in, now do the smart timing
+    if (event.action === 'RECALCULATE') {
+      try {
+        // Find the reservation to get dates
+        const reservation = await getReservation(event.reservationId);
+        const checkIn = new Date(`${reservation.arrivalDate}T${String(property.checkInHour).padStart(2, '0')}:00:00`);
+        const heaterOffTime = calculateHeaterOffTime(
+          reservation.arrivalDate, reservation.departureDate, event.heatDays ?? null, property.timezone
+        );
+        const heatDaysLabel = event.heatDays == null
+          ? 'full stay'
+          : `${event.heatDays} day${event.heatDays > 1 ? 's' : ''}`;
+
+        await scheduleSmartTiming(reservation, property, event.targetTemp, checkIn, heaterOffTime, heatDaysLabel);
+      } catch (err: any) {
+        await sendAlert('error', `Recalculate failed — ${property.name}`, `Guest: ${event.guestName}\nError: ${err.message}`);
+      }
+      continue;
+    }
+
+    const heaterAction = event.action as 'ON' | 'OFF';
+
     if (property.poolSystem === 'screenlogic' && property.screenlogicGateway) {
       // Automated control
       try {
         let result;
-        if (event.action === 'ON') {
+        if (heaterAction === 'ON') {
           result = await setPoolHeat(property.screenlogicGateway, event.targetTemp);
         } else {
           result = await turnOffPoolHeat(property.screenlogicGateway);
@@ -242,7 +323,7 @@ async function executeScheduledEvents() {
 
         await alertHeaterAction(
           property.name,
-          event.action,
+          heaterAction,
           result.success,
           result.message,
           event.guestName
@@ -258,13 +339,13 @@ async function executeScheduledEvents() {
 
               await alertHeaterAction(
                 property.name,
-                event.action,
+                heaterAction,
                 retry.success,
                 `RETRY: ${retry.message}`,
                 event.guestName
               );
             } catch (err: any) {
-              await alertHeaterAction(property.name, event.action, false, `RETRY FAILED: ${err.message}`, event.guestName);
+              await alertHeaterAction(property.name, heaterAction, false, `RETRY FAILED: ${err.message}`, event.guestName);
             }
           }, 5 * 60 * 1000);
         }
@@ -274,7 +355,7 @@ async function executeScheduledEvents() {
     } else {
       // IntelliConnect — send reminder
       const checkTime = event.scheduledTime.toLocaleString('en-US', { timeZone: property.timezone });
-      await alertManualReminder(property.name, event.action, event.guestName, checkTime);
+      await alertManualReminder(property.name, heaterAction, event.guestName, checkTime);
     }
   }
 }
