@@ -80,6 +80,7 @@ export const config = {
   },
   server: {
     port: Number(process.env.PORT) || 3100,
-    webhookSecret: process.env.WEBHOOK_SECRET || '',
+    webhookLogin: process.env.WEBHOOK_LOGIN || '',
+    webhookPassword: process.env.WEBHOOK_PASSWORD || '',
   },
 };

@@ -89,6 +89,56 @@ export async function getReservation(id: number): Promise<Reservation> {
 /**
  * Get conversation messages for a reservation to scan for pool heat discussion.
  */
+/**
+ * Get a conversation by its ID (used by message webhooks).
+ * Returns the conversation object which includes reservationId.
+ */
+export async function getConversation(conversationId: number): Promise<any> {
+  return hostawayGet(`/conversations/${conversationId}`);
+}
+
+/**
+ * Register a webhook with Hostaway.
+ */
+export async function registerWebhook(url: string, event: string): Promise<any> {
+  const token = await getAccessToken();
+  const res = await fetch(`${config.hostaway.baseUrl}/webhooks`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ url, event }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Hostaway webhook registration failed: ${res.status} ${await res.text()}`);
+  }
+
+  return (await res.json() as any).result;
+}
+
+/**
+ * List all registered webhooks.
+ */
+export async function listWebhooks(): Promise<any[]> {
+  return (await hostawayGet('/webhooks')) || [];
+}
+
+/**
+ * Delete a webhook by ID.
+ */
+export async function deleteWebhook(webhookId: number): Promise<void> {
+  const token = await getAccessToken();
+  const res = await fetch(`${config.hostaway.baseUrl}/webhooks/${webhookId}`, {
+    method: 'DELETE',
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`Hostaway webhook delete failed: ${res.status} ${await res.text()}`);
+  }
+}
+
 export async function getConversationMessages(reservationId: number): Promise<any[]> {
   try {
     const conversations = await hostawayGet('/conversations', {

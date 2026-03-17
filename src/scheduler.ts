@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import { properties, PropertyConfig } from './config';
-import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, getReservation, Reservation, PoolHeatResult } from './hostaway';
+import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, getReservation, getConversation, Reservation, PoolHeatResult } from './hostaway';
 import { getPoolStatus, setPoolHeat, turnOffPoolHeat } from './screenlogic';
 import { calculateHeaterStartTime } from './weather';
 import { alertHeaterAction, alertManualReminder, sendAlert } from './alerts';
@@ -398,6 +398,54 @@ export async function handleReservationWebhook(reservation: Reservation) {
   const heatResult = await checkReservationHeat(reservation);
   if (heatResult.status === 'agreed') {
     await scheduleForReservation(reservation, property, heatResult);
+  }
+}
+
+/**
+ * Handle a message webhook — a new guest message arrived in a conversation.
+ * Look up the reservation, scan for pool heat, and schedule if agreed.
+ */
+export async function handleMessageWebhook(conversationId: number) {
+  try {
+    // Get the conversation to find the reservationId
+    const conversation = await getConversation(conversationId);
+    const reservationId = conversation?.reservationId;
+    if (!reservationId) {
+      console.log(`[Message Webhook] Conversation ${conversationId} has no reservation — skipping`);
+      return;
+    }
+
+    // Get the reservation to find the property
+    const reservation = await getReservation(reservationId);
+    const property = getPropertyForListing(reservation.listingMapId);
+    if (!property) {
+      console.log(`[Message Webhook] Reservation ${reservationId} is not a pool property — skipping`);
+      return;
+    }
+
+    // Already scheduled? Skip re-scan.
+    const alreadyScheduled = scheduledEvents.some(
+      e => e.reservationId === reservationId && !e.executed
+    );
+    if (alreadyScheduled) {
+      console.log(`[Message Webhook] Reservation ${reservationId} already scheduled — skipping`);
+      return;
+    }
+
+    // Scan messages for pool heat agreement
+    const heatResult = await checkReservationHeat(reservation);
+    console.log(`[Message Webhook] Reservation ${reservationId} (${property.name}) — status: ${heatResult.status}`);
+
+    if (heatResult.status === 'agreed') {
+      await scheduleForReservation(reservation, property, heatResult);
+      await sendAlert('info',
+        `Real-time detection — ${property.name}`,
+        `Guest ${reservation.guestName} agreed to pool heat via message webhook (no polling delay).`
+      );
+    }
+  } catch (err: any) {
+    console.error(`[Message Webhook] Error processing conversation ${conversationId}: ${err.message}`);
+    await sendAlert('error', 'Message webhook error', `Conversation ${conversationId}: ${err.message}`);
   }
 }
 
