@@ -74,8 +74,11 @@ export async function getAllUpcomingReservations(listingIds: number[]): Promise<
 
   // Client-side filter: only confirmed reservations for our pool properties
   // "modified" = confirmed booking. Exclude inquiry, cancelled, ownerStay, etc.
+  // Also exclude reservations that have already departed (departure <= today)
   return (result || []).filter((r: Reservation) =>
-    listingIds.includes(r.listingMapId) && r.status === 'modified'
+    listingIds.includes(r.listingMapId) &&
+    r.status === 'modified' &&
+    r.departureDate > today
   );
 }
 

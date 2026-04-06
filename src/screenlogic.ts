@@ -1,5 +1,5 @@
-import { RemoteLogin, UnitConnection, BodyIndex, HeatModes } from 'node-screenlogic';
-import type { SLEquipmentStateData } from 'node-screenlogic';
+import { RemoteLogin, UnitConnection, BodyIndex, HeatModes, SchedTypes } from 'node-screenlogic';
+import type { SLEquipmentStateData, SLScheduleDatum } from 'node-screenlogic';
 
 interface PoolStatus {
   poolTemp: number;
@@ -144,5 +144,125 @@ export async function turnOffPoolHeat(
     }
   } catch (err: any) {
     return { success: false, message: `Failed to turn off pool heat: ${err.message}` };
+  }
+}
+
+// --- Pentair Schedule Management ---
+
+/** Convert decoded time string "HHMM" back to minutes since midnight. */
+function timeStringToMinutes(t: string): number {
+  return parseInt(t.substring(0, 2)) * 60 + parseInt(t.substring(2, 4));
+}
+
+interface PoolScheduleInfo {
+  poolCircuitId: number;
+  schedule: {
+    scheduleId: number;
+    circuitId: number;
+    startTime: number;
+    stopTime: number;
+    dayMask: number;
+    flags: number;
+    heatCmd: number;
+    heatSetPoint: number;
+  };
+}
+
+/**
+ * Discover the pool circuit and its recurring schedule dynamically.
+ * Finds the circuit with function=2 (Pool), then finds its recurring schedule.
+ */
+async function discoverPoolSchedule(client: UnitConnection): Promise<PoolScheduleInfo> {
+  const equipConfig = await client.equipment.getControllerConfigAsync();
+  const circuitArray = (equipConfig as any).circuitArray as Array<{ circuitId: number; function: number; name: string }>;
+  if (!circuitArray) {
+    throw new Error('No circuitArray in controller config');
+  }
+
+  const poolCircuit = circuitArray.find(c => c.function === 2);
+  if (!poolCircuit) {
+    throw new Error('No pool circuit found (function=2)');
+  }
+
+  const schedules = await client.schedule.getScheduleDataAsync(SchedTypes.RECURRING);
+  const poolSchedule = schedules.data.find(s => s.circuitId === poolCircuit.circuitId);
+  if (!poolSchedule) {
+    throw new Error(`No recurring schedule found for pool circuit ${poolCircuit.circuitId} ("${poolCircuit.name}")`);
+  }
+
+  return {
+    poolCircuitId: poolCircuit.circuitId,
+    schedule: {
+      scheduleId: poolSchedule.scheduleId,
+      circuitId: poolSchedule.circuitId,
+      startTime: timeStringToMinutes(poolSchedule.startTime),
+      stopTime: timeStringToMinutes(poolSchedule.stopTime),
+      dayMask: poolSchedule.dayMask,
+      flags: poolSchedule.flags,
+      heatCmd: poolSchedule.heatCmd,
+      heatSetPoint: poolSchedule.heatSetPoint,
+    },
+  };
+}
+
+/**
+ * Update the Pentair controller's pool schedule to enable heating.
+ * Keeps all existing schedule settings (time, days, flags) but sets
+ * heatCmd=HEATER and heatSetPoint to the target temp.
+ */
+export async function updatePoolScheduleHeatOn(
+  gatewayName: string,
+  targetTemp: number,
+  password?: string
+): Promise<{ success: boolean; message: string }> {
+  try {
+    const client = await connectRemote(gatewayName, password);
+    try {
+      const { poolCircuitId, schedule: s } = await discoverPoolSchedule(client);
+
+      await client.schedule.setScheduleEventByIdAsync(
+        s.scheduleId, s.circuitId, s.startTime, s.stopTime,
+        s.dayMask, s.flags, HeatModes.HEAT_MODE_HEATER, targetTemp
+      );
+
+      return {
+        success: true,
+        message: `Schedule #${s.scheduleId} (circuit ${poolCircuitId}) updated: heater ON at ${targetTemp}°F`,
+      };
+    } finally {
+      await client.closeAsync();
+    }
+  } catch (err: any) {
+    return { success: false, message: `Failed to update pool schedule: ${err.message}` };
+  }
+}
+
+/**
+ * Update the Pentair controller's pool schedule to disable heating.
+ * Keeps all existing schedule settings but sets heatCmd=OFF.
+ */
+export async function updatePoolScheduleHeatOff(
+  gatewayName: string,
+  password?: string
+): Promise<{ success: boolean; message: string }> {
+  try {
+    const client = await connectRemote(gatewayName, password);
+    try {
+      const { poolCircuitId, schedule: s } = await discoverPoolSchedule(client);
+
+      await client.schedule.setScheduleEventByIdAsync(
+        s.scheduleId, s.circuitId, s.startTime, s.stopTime,
+        s.dayMask, s.flags, HeatModes.HEAT_MODE_OFF, s.heatSetPoint
+      );
+
+      return {
+        success: true,
+        message: `Schedule #${s.scheduleId} (circuit ${poolCircuitId}) updated: heater OFF`,
+      };
+    } finally {
+      await client.closeAsync();
+    }
+  } catch (err: any) {
+    return { success: false, message: `Failed to update pool schedule: ${err.message}` };
   }
 }

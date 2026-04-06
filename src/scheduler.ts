@@ -1,7 +1,7 @@
 import cron from 'node-cron';
 import { properties, PropertyConfig } from './config';
 import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, getReservation, getConversation, Reservation, PoolHeatResult } from './hostaway';
-import { getPoolStatus, setPoolHeat, turnOffPoolHeat } from './screenlogic';
+import { getPoolStatus, setPoolHeat, turnOffPoolHeat, updatePoolScheduleHeatOn, updatePoolScheduleHeatOff } from './screenlogic';
 import { calculateHeaterStartTime } from './weather';
 import { alertHeaterAction, alertManualReminder, sendAlert } from './alerts';
 import { getTargetTempForStay } from './pricing';
@@ -82,9 +82,16 @@ async function scheduleForReservation(
   property: PropertyConfig,
   heatResult: PoolHeatResult
 ) {
-  // Check if already scheduled
+  // Don't schedule for reservations that have already departed
+  const today = new Date().toISOString().split('T')[0];
+  if (reservation.departureDate <= today) {
+    console.log(`[Schedule] Skipping ${reservation.guestName} at ${property.name} — departure ${reservation.departureDate} is today or past`);
+    return;
+  }
+
+  // Check if already scheduled (include executed events to prevent re-scheduling after restart)
   const existing = scheduledEvents.find(
-    e => e.reservationId === reservation.id && !e.executed
+    e => e.reservationId === reservation.id
   );
   if (existing) return;
 
@@ -329,6 +336,22 @@ async function executeScheduledEvents() {
           event.guestName
         );
 
+        // Also update the Pentair controller's built-in schedule
+        try {
+          const schedResult = heaterAction === 'ON'
+            ? await updatePoolScheduleHeatOn(property.screenlogicGateway, event.targetTemp)
+            : await updatePoolScheduleHeatOff(property.screenlogicGateway);
+          if (schedResult.success) {
+            console.log(`[Schedule] ${schedResult.message}`);
+          } else {
+            console.error(`[Schedule] ${schedResult.message}`);
+            await sendAlert('warning', `Schedule update failed — ${property.name}`, schedResult.message);
+          }
+        } catch (schedErr: any) {
+          console.error(`[Schedule] Error for ${property.name}: ${schedErr.message}`);
+          await sendAlert('warning', `Schedule update error — ${property.name}`, schedErr.message);
+        }
+
         // If failed, retry once after 5 minutes
         if (!result.success) {
           setTimeout(async () => {
@@ -344,6 +367,20 @@ async function executeScheduledEvents() {
                 `RETRY: ${retry.message}`,
                 event.guestName
               );
+
+              // Retry schedule update too
+              try {
+                const schedRetry = heaterAction === 'ON'
+                  ? await updatePoolScheduleHeatOn(property.screenlogicGateway!, event.targetTemp)
+                  : await updatePoolScheduleHeatOff(property.screenlogicGateway!);
+                if (schedRetry.success) {
+                  console.log(`[Schedule] RETRY: ${schedRetry.message}`);
+                } else {
+                  console.error(`[Schedule] RETRY failed: ${schedRetry.message}`);
+                }
+              } catch (schedErr: any) {
+                console.error(`[Schedule] RETRY error: ${schedErr.message}`);
+              }
             } catch (err: any) {
               await alertHeaterAction(property.name, heaterAction, false, `RETRY FAILED: ${err.message}`, event.guestName);
             }
@@ -395,6 +432,13 @@ export async function handleReservationWebhook(reservation: Reservation) {
   const property = getPropertyForListing(reservation.listingMapId);
   if (!property) return;
 
+  // Skip checked-out reservations (webhooks fire on checkout status changes too)
+  const today = new Date().toISOString().split('T')[0];
+  if (reservation.departureDate <= today) {
+    console.log(`[Webhook] Skipping ${reservation.guestName} — already departed ${reservation.departureDate}`);
+    return;
+  }
+
   const heatResult = await checkReservationHeat(reservation);
   if (heatResult.status === 'agreed') {
     await scheduleForReservation(reservation, property, heatResult);
@@ -423,9 +467,16 @@ export async function handleMessageWebhook(conversationId: number) {
       return;
     }
 
-    // Already scheduled? Skip re-scan.
+    // Skip checked-out reservations
+    const today = new Date().toISOString().split('T')[0];
+    if (reservation.departureDate <= today) {
+      console.log(`[Message Webhook] Reservation ${reservationId} already departed ${reservation.departureDate} — skipping`);
+      return;
+    }
+
+    // Already scheduled? Skip re-scan (include executed events to prevent re-fire after restart).
     const alreadyScheduled = scheduledEvents.some(
-      e => e.reservationId === reservationId && !e.executed
+      e => e.reservationId === reservationId
     );
     if (alreadyScheduled) {
       console.log(`[Message Webhook] Reservation ${reservationId} already scheduled — skipping`);

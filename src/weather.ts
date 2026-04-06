@@ -1,21 +1,10 @@
 /**
- * Smart heat-up time estimation using pool thermodynamics + weather forecasts.
+ * Smart heat-up time estimation using empirical heating rates + weather forecasts.
  *
- * Physics model:
- * - Gross heating rate = (heaterBTU × efficiency) / (poolGallons × 8.34 lbs/gal)
- * - Heat loss = surfaceArea × windFactor × (waterTemp - airTemp) / (poolGallons × 8.34)
- * - Net rate = gross - loss (varies hour by hour as water temp rises and air temp changes)
- * - Simulates hour-by-hour to account for overnight cooling, dawn warming, etc.
+ * Based on real-world observation: ~1°F/hr net heating rate for a 250K BTU
+ * propane heater on a ~20K gallon uncovered pool, with reduced rates during
+ * cold overnight temps when heat loss is higher.
  */
-
-// Pool defaults (can be overridden per property later)
-const POOL_DEFAULTS = {
-  gallons: 20_000,
-  heaterBTU: 250_000,
-  heaterEfficiency: 0.82, // propane heater ~80-85% efficient
-  surfaceAreaSqFt: 450,   // typical 20K gallon pool ~15x30
-  waterWeightPerGallon: 8.34, // lbs
-};
 
 interface HourlyForecast {
   time: string[];
@@ -31,6 +20,16 @@ export interface ForecastPoint {
   time: Date;
   tempF: number;
   windMph: number;
+}
+
+/**
+ * Empirical net heating rate based on air temperature.
+ * ~1°F/hr in normal conditions, reduced in cold overnight temps.
+ */
+function netHeatingRate(airTempF: number): number {
+  if (airTempF >= 50) return 1.0;
+  if (airTempF >= 35) return 0.75;
+  return 0.5;
 }
 
 export async function getHourlyForecast(
@@ -54,56 +53,9 @@ export async function getHourlyForecast(
 }
 
 /**
- * Calculate gross heating rate in °F/hour.
- * Formula: (BTU × efficiency) / (gallons × 8.34 lbs/gal)
+ * Simulate hour-by-hour pool heating using empirical rates + weather forecast.
  *
- * 250K BTU × 0.82 / (20,000 × 8.34) = ~1.23°F/hr gross
- */
-function grossHeatingRate(
-  heaterBTU: number = POOL_DEFAULTS.heaterBTU,
-  efficiency: number = POOL_DEFAULTS.heaterEfficiency,
-  gallons: number = POOL_DEFAULTS.gallons
-): number {
-  return (heaterBTU * efficiency) / (gallons * POOL_DEFAULTS.waterWeightPerGallon);
-}
-
-/**
- * Calculate heat loss rate in °F/hour for an uncovered pool.
- *
- * Dominant losses: evaporation (~60%), radiation (~20%), convection (~20%)
- * Simplified model using empirical wind-adjusted coefficient.
- *
- * Loss (BTU/hr) ≈ surfaceArea × coefficient × (waterTemp - airTemp)
- * coefficient ≈ 4 + 3.5 × windMph^0.5 (empirical, uncovered pool)
- *
- * Then convert BTU/hr loss to °F/hr: loss_BTU / (gallons × 8.34)
- */
-function heatLossRate(
-  waterTempF: number,
-  airTempF: number,
-  windMph: number,
-  surfaceArea: number = POOL_DEFAULTS.surfaceAreaSqFt,
-  gallons: number = POOL_DEFAULTS.gallons
-): number {
-  const tempDiff = waterTempF - airTempF;
-  if (tempDiff <= 0) return 0; // Pool is colder than air, no net loss
-
-  // Wind-adjusted loss coefficient (BTU/hr/sqft/°F)
-  const coefficient = 4 + 3.5 * Math.sqrt(Math.max(windMph, 0));
-
-  const lossBTUPerHour = surfaceArea * coefficient * tempDiff;
-  return lossBTUPerHour / (gallons * POOL_DEFAULTS.waterWeightPerGallon);
-}
-
-/**
- * Simulate hour-by-hour pool heating to determine how many hours
- * before a target time the heater needs to turn on.
- *
- * Works backwards from the check-in time through the forecast,
- * simulating the pool temp each hour to find when to start.
- *
- * Returns: how many hours before checkIn to start, and the estimated
- * pool temp trajectory.
+ * Returns: how many hours of heating needed and the hourly trajectory.
  */
 export function simulateHeatUp(
   currentPoolTemp: number,
@@ -115,26 +67,22 @@ export function simulateHeatUp(
     return { hoursNeeded: 0, trajectory: [] };
   }
 
-  const gross = grossHeatingRate();
   const trajectory: { hour: number; poolTemp: number; airTemp: number; netRate: number }[] = [];
-
-  // Simulate forward from now, hour by hour
   let poolTemp = currentPoolTemp;
   let hoursNeeded = 0;
 
   for (let h = 0; h < forecast.length && h < 72; h++) {
     const fc = forecast[h];
-    const loss = heatLossRate(poolTemp, fc.tempF, fc.windMph);
-    const netRate = Math.max(gross - loss, 0.1); // Heater always makes some progress
+    const rate = netHeatingRate(fc.tempF);
 
     trajectory.push({
       hour: h,
       poolTemp: Math.round(poolTemp * 10) / 10,
       airTemp: fc.tempF,
-      netRate: Math.round(netRate * 100) / 100,
+      netRate: rate,
     });
 
-    poolTemp += netRate;
+    poolTemp += rate;
 
     if (poolTemp >= targetTemp) {
       hoursNeeded = h + 1;
@@ -142,7 +90,6 @@ export function simulateHeatUp(
     }
   }
 
-  // If we never reached target in 72h, cap it
   if (poolTemp < targetTemp) {
     hoursNeeded = 72;
   }
