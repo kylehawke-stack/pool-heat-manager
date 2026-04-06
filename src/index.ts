@@ -58,6 +58,7 @@ app.post('/webhook/hostaway', async (req, res) => {
       event === 'conversationMessage.created' ||
       event === 'conversation_message.created' ||
       event === 'message.created' ||
+      event === 'message.received' ||
       event === 'new_message'
     ) {
       const data = body.data || body.message || body;
