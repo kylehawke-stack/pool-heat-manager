@@ -20,7 +20,7 @@ rsync -avz --delete \
   --exclude '.env' \
   --exclude 'logs' \
   --exclude '.git' \
-  /home/brady/pool-heat-manager/ \
+  /home/kyle/projects/pool-heat-manager/ \
   ${SERVER}:${REMOTE_DIR}/
 
 # Install deps and restart

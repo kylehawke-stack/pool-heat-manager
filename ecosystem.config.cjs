@@ -6,6 +6,11 @@ module.exports = {
     cwd: '/root/pool-heat-manager',
     env: {
       NODE_ENV: 'production',
+      // All properties are in America/New_York. The app also uses
+      // property.timezone for wall-clock calculations via zonedDate(),
+      // but setting TZ here is a safety net so naive Date parsing and
+      // log timestamps also land in ET instead of UTC.
+      TZ: 'America/New_York',
     },
     // Auto-restart on crash
     autorestart: true,

@@ -110,7 +110,13 @@ export async function calculateHeaterStartTime(
   currentPoolTemp: number | null,
   latitude: number,
   longitude: number
-): Promise<{ startTime: Date; estimatedHours: number; avgAirTemp: number }> {
+): Promise<{
+  startTime: Date;
+  estimatedHours: number;
+  avgAirTemp: number;
+  clamped: boolean;
+  shortfallHours: number;
+}> {
   const forecast = await getHourlyForecast(latitude, longitude, 72);
 
   // If we don't know pool temp, estimate from recent air temps
@@ -126,13 +132,21 @@ export async function calculateHeaterStartTime(
 
   // Add 2 hour buffer, and ensure we don't start in the past
   const totalHours = hoursNeeded + 2;
-  const startTime = new Date(checkInTime.getTime() - totalHours * 60 * 60 * 1000);
+  const idealStart = new Date(checkInTime.getTime() - totalHours * 60 * 60 * 1000);
   const now = new Date();
-  const effectiveStart = startTime < now ? now : startTime;
+  const clamped = idealStart < now;
+  const effectiveStart = clamped ? now : idealStart;
+
+  // If clamped, how many hours of heat-up we're losing vs. the ideal schedule.
+  const shortfallHours = clamped
+    ? Math.max(0, (now.getTime() - idealStart.getTime()) / (1000 * 60 * 60))
+    : 0;
 
   return {
     startTime: effectiveStart,
     estimatedHours: hoursNeeded,
     avgAirTemp,
+    clamped,
+    shortfallHours,
   };
 }

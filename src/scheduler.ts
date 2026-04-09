@@ -25,6 +25,36 @@ function getPropertyForListing(listingId: number): PropertyConfig | undefined {
 }
 
 /**
+ * Construct a Date representing a wall-clock time in a specific IANA timezone.
+ *
+ * JavaScript's `new Date('YYYY-MM-DDTHH:MM:SS')` parses the string in the server's
+ * local timezone, which is UTC on the DigitalOcean droplet. That caused heater
+ * actions to fire 4 hours early (e.g. "8 PM ET" becoming 20:00 UTC = 4 PM ET).
+ * This helper uses Intl.DateTimeFormat to find the correct UTC offset, handling DST.
+ */
+function zonedDate(isoDate: string, hour: number, minute: number, timezone: string): Date {
+  const [year, month, day] = isoDate.split('-').map(Number);
+
+  // Build the wall-clock values as if they were UTC
+  const asUtc = Date.UTC(year, month - 1, day, hour, minute, 0);
+
+  // Ask Intl what wall-clock time that UTC instant represents in the target zone.
+  // The difference between the target and actual is the offset to apply.
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(asUtc));
+  const get = (t: string) => Number(parts.find(p => p.type === t)!.value);
+  const shownAsUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
+
+  // shownAsUtc - asUtc = timezone offset (negative for zones west of UTC)
+  // To represent the desired wall time, shift UTC by the opposite of that offset.
+  return new Date(asUtc - (shownAsUtc - asUtc));
+}
+
+/**
  * Check if a reservation qualifies for pool heat by scanning messages.
  * Returns the scan result with status and heat days.
  */
@@ -38,10 +68,13 @@ async function checkReservationHeat(reservation: Reservation): Promise<PoolHeatR
 
 /**
  * Calculate the heater OFF time.
- * - If heatDays is null (full stay): 8 PM on departure date
- * - If heatDays is a number: 8 PM on (arrival + heatDays) days
+ * - If heatDays is null (full stay): 8 PM local on departure date
+ * - If heatDays is a number: 8 PM local on (arrival + heatDays) days
  *
  * The heater turns off at 8 PM on the last paid heat day, not at checkout.
+ *
+ * Special case: for 1-night stays, the heater stays on until 23:59 on the arrival
+ * day (through the guest's single night), rather than cutting off at 8 PM.
  */
 function calculateHeaterOffTime(
   arrivalDate: string,
@@ -49,29 +82,36 @@ function calculateHeaterOffTime(
   heatDays: number | null,
   timezone: string
 ): Date {
+  // Use UTC parsing for date arithmetic so it's immune to server timezone.
+  const parseDay = (d: string) => new Date(d + 'T00:00:00Z');
+  const addDays = (d: Date, n: number) => { const c = new Date(d); c.setUTCDate(c.getUTCDate() + n); return c; };
+  const toIsoDay = (d: Date) => d.toISOString().split('T')[0];
+
+  const arrDay = parseDay(arrivalDate);
+  const depDay = parseDay(departureDate);
+  const totalNights = Math.round((depDay.getTime() - arrDay.getTime()) / (1000 * 60 * 60 * 24));
+
   let lastHeatDate: string;
 
   if (heatDays === null) {
-    // Full stay — last heat day is the day before departure (guest's last night)
-    const dep = new Date(departureDate + 'T00:00:00');
-    dep.setDate(dep.getDate() - 1);
-    lastHeatDate = dep.toISOString().split('T')[0];
+    // Full stay — last heat day is the night before departure
+    lastHeatDate = toIsoDay(addDays(depDay, -1));
   } else {
-    // Partial stay — heat for N days starting from arrival
-    const arr = new Date(arrivalDate + 'T00:00:00');
-    arr.setDate(arr.getDate() + heatDays - 1);
-    // Don't go past departure
-    const dep = new Date(departureDate + 'T00:00:00');
-    dep.setDate(dep.getDate() - 1);
-    if (arr > dep) {
-      lastHeatDate = dep.toISOString().split('T')[0];
-    } else {
-      lastHeatDate = arr.toISOString().split('T')[0];
-    }
+    // Partial stay — heat for N days starting from arrival, capped at departure
+    const lastPaidDay = addDays(arrDay, heatDays - 1);
+    const lastStayDay = addDays(depDay, -1);
+    lastHeatDate = toIsoDay(lastPaidDay > lastStayDay ? lastStayDay : lastPaidDay);
   }
 
-  // 8 PM on the last heat day
-  return new Date(`${lastHeatDate}T20:00:00`);
+  // 1-night stays: keep the heater on through the night (23:59 on arrival day)
+  // instead of cutting off at 8 PM. Brady's rule: guest should get the pool
+  // for their whole single evening.
+  if (totalNights === 1) {
+    return zonedDate(lastHeatDate, 23, 59, timezone);
+  }
+
+  // Otherwise: 8 PM local time on the last heat day.
+  return zonedDate(lastHeatDate, 20, 0, timezone);
 }
 
 /**
@@ -95,8 +135,8 @@ async function scheduleForReservation(
   );
   if (existing) return;
 
-  // Build check-in datetime
-  const checkIn = new Date(`${reservation.arrivalDate}T${String(property.checkInHour).padStart(2, '0')}:00:00`);
+  // Build check-in datetime in the property's local timezone.
+  const checkIn = zonedDate(reservation.arrivalDate, property.checkInHour, 0, property.timezone);
 
   // Use season-based target temp — majority month of the stay, not just arrival date
   // e.g. March 31 check-in with April stay = 80°F (April rate)
@@ -183,7 +223,7 @@ async function scheduleSmartTiming(
       // Can't read temp — will estimate from air temp
     }
 
-    const { startTime, estimatedHours, avgAirTemp } = await calculateHeaterStartTime(
+    const { startTime, estimatedHours, avgAirTemp, clamped, shortfallHours } = await calculateHeaterStartTime(
       checkIn, targetTemp, currentPoolTemp, property.latitude, property.longitude
     );
 
@@ -213,18 +253,39 @@ async function scheduleSmartTiming(
       });
     }
 
-    await sendAlert('info',
-      `Heat smart-timed — ${property.name}`,
-      [
-        `Guest: ${reservation.guestName}`,
-        `Stay: ${reservation.arrivalDate} → ${reservation.departureDate}`,
-        `Heat duration: ${heatDaysLabel}`,
-        `Target: ${targetTemp}°F`,
-        `Current pool temp: ${currentPoolTemp ?? 'unknown'}°F`,
-        `Avg air temp forecast: ${avgAirTemp.toFixed(1)}°F`,
-        `Heater ON: ${startTime.toLocaleString('en-US', { timeZone: property.timezone })} (${estimatedHours}h to heat)`,
-        `Heater OFF: ${heaterOffTime.toLocaleString('en-US', { timeZone: property.timezone })}`,
-      ].join('\n')
+    // Late-detection warning: if we had to clamp the start time to "now",
+    // the pool may not reach target by check-in. Surface it on the alert.
+    const alertLevel = clamped ? 'warning' : 'info';
+    const alertSubject = clamped
+      ? `⚠️ Heat compressed — ${property.name}`
+      : `Heat smart-timed — ${property.name}`;
+
+    const hoursUntilCheckIn = (checkIn.getTime() - startTime.getTime()) / (1000 * 60 * 60);
+    const gapF = currentPoolTemp != null ? Math.max(0, targetTemp - currentPoolTemp) : null;
+
+    const lines = [
+      `Guest: ${reservation.guestName}`,
+      `Stay: ${reservation.arrivalDate} → ${reservation.departureDate}`,
+      `Heat duration: ${heatDaysLabel}`,
+      `Target: ${targetTemp}°F`,
+      `Current pool temp: ${currentPoolTemp ?? 'unknown'}°F`,
+      `Avg air temp forecast: ${avgAirTemp.toFixed(1)}°F`,
+      `Heater ON: ${startTime.toLocaleString('en-US', { timeZone: property.timezone })} (${estimatedHours}h to heat)`,
+      `Heater OFF: ${heaterOffTime.toLocaleString('en-US', { timeZone: property.timezone })}`,
+    ];
+    if (clamped) {
+      lines.push('');
+      lines.push(`⚠️ LATE DETECTION: ideal start was ${shortfallHours.toFixed(1)}h ago.`);
+      lines.push(`Only ${hoursUntilCheckIn.toFixed(1)}h until check-in at ${checkIn.toLocaleString('en-US', { timeZone: property.timezone })}.`);
+      if (gapF != null) {
+        lines.push(`Need ${gapF.toFixed(1)}°F of heat-up; at ~1°F/hr that needs ${(gapF + 2).toFixed(0)}h including buffer.`);
+      }
+      lines.push(`Pool may not reach ${targetTemp}°F by guest arrival. Consider manual intervention.`);
+    }
+
+    await sendAlert(alertLevel,
+      alertSubject,
+      lines.join('\n')
     );
   } else {
     // IntelliConnect — smart reminder timing
@@ -301,7 +362,7 @@ async function executeScheduledEvents() {
       try {
         // Find the reservation to get dates
         const reservation = await getReservation(event.reservationId);
-        const checkIn = new Date(`${reservation.arrivalDate}T${String(property.checkInHour).padStart(2, '0')}:00:00`);
+        const checkIn = zonedDate(reservation.arrivalDate, property.checkInHour, 0, property.timezone);
         const heaterOffTime = calculateHeaterOffTime(
           reservation.arrivalDate, reservation.departureDate, event.heatDays ?? null, property.timezone
         );
