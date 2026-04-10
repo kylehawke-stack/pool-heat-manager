@@ -380,24 +380,13 @@ async function executeScheduledEvents() {
     const heaterAction = event.action as 'ON' | 'OFF';
 
     if (property.poolSystem === 'screenlogic' && property.screenlogicGateway) {
-      // Automated control
+      // Automated control.
+      // IMPORTANT: update the schedule FIRST, then set the body. The Pentair
+      // controller periodically re-syncs the pool body's heat settings from the
+      // active schedule. If we set the body first, the controller can undo it
+      // before we update the schedule — leaving "schedule ON, body OFF".
       try {
-        let result;
-        if (heaterAction === 'ON') {
-          result = await setPoolHeat(property.screenlogicGateway, event.targetTemp);
-        } else {
-          result = await turnOffPoolHeat(property.screenlogicGateway);
-        }
-
-        await alertHeaterAction(
-          property.name,
-          heaterAction,
-          result.success,
-          result.message,
-          event.guestName
-        );
-
-        // Also update the Pentair controller's built-in schedule
+        // Step 1: Update the Pentair controller's built-in schedule
         try {
           const schedResult = heaterAction === 'ON'
             ? await updatePoolScheduleHeatOn(property.screenlogicGateway, event.targetTemp)
@@ -413,23 +402,27 @@ async function executeScheduledEvents() {
           await sendAlert('warning', `Schedule update error — ${property.name}`, schedErr.message);
         }
 
+        // Step 2: Set pool body heat mode (now safe — schedule already agrees)
+        let result;
+        if (heaterAction === 'ON') {
+          result = await setPoolHeat(property.screenlogicGateway, event.targetTemp);
+        } else {
+          result = await turnOffPoolHeat(property.screenlogicGateway);
+        }
+
+        await alertHeaterAction(
+          property.name,
+          heaterAction,
+          result.success,
+          result.message,
+          event.guestName
+        );
+
         // If failed, retry once after 5 minutes
         if (!result.success) {
           setTimeout(async () => {
             try {
-              const retry = event.action === 'ON'
-                ? await setPoolHeat(property.screenlogicGateway!, event.targetTemp)
-                : await turnOffPoolHeat(property.screenlogicGateway!);
-
-              await alertHeaterAction(
-                property.name,
-                heaterAction,
-                retry.success,
-                `RETRY: ${retry.message}`,
-                event.guestName
-              );
-
-              // Retry schedule update too
+              // Retry schedule first, then body (same order)
               try {
                 const schedRetry = heaterAction === 'ON'
                   ? await updatePoolScheduleHeatOn(property.screenlogicGateway!, event.targetTemp)
@@ -442,6 +435,18 @@ async function executeScheduledEvents() {
               } catch (schedErr: any) {
                 console.error(`[Schedule] RETRY error: ${schedErr.message}`);
               }
+
+              const retry = event.action === 'ON'
+                ? await setPoolHeat(property.screenlogicGateway!, event.targetTemp)
+                : await turnOffPoolHeat(property.screenlogicGateway!);
+
+              await alertHeaterAction(
+                property.name,
+                heaterAction,
+                retry.success,
+                `RETRY: ${retry.message}`,
+                event.guestName
+              );
             } catch (err: any) {
               await alertHeaterAction(property.name, heaterAction, false, `RETRY FAILED: ${err.message}`, event.guestName);
             }
