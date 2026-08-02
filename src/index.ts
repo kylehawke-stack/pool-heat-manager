@@ -1,4 +1,5 @@
 import express from 'express';
+import crypto from 'crypto';
 import { config } from './config';
 import { handleReservationWebhook, handleMessageWebhook, startScheduler, getScheduleState, scanReservations, forceAgreement, markDeclined, markUndecided, delayHeaterOn } from './scheduler';
 import { sendAlert } from './alerts';
@@ -26,13 +27,24 @@ app.get('/health', (_req, res) => {
 
 /**
  * Verify Basic Auth credentials sent by Hostaway with webhook requests.
- * Returns true if no credentials are configured (backwards compatible).
+ * Hostaway includes an Authorization: Basic header only when the webhook
+ * registration has login/password set. Returns true if no credentials are
+ * configured locally (local dev / OSS default).
  */
 function verifyWebhookAuth(req: express.Request): boolean {
-  // TODO: Re-enable once we confirm Hostaway sends Basic Auth correctly
-  // For now, log what headers Hostaway actually sends so we can debug
-  console.log('[Webhook] Headers:', JSON.stringify(req.headers));
-  return true;
+  const { webhookLogin, webhookPassword } = config.server;
+  if (!webhookLogin && !webhookPassword) {
+    console.warn('[Webhook] WEBHOOK_LOGIN/WEBHOOK_PASSWORD not set — accepting unauthenticated webhook');
+    return true;
+  }
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Basic ')) return false;
+  const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+  const sep = decoded.indexOf(':');
+  if (sep === -1) return false;
+  const expected = Buffer.from(`${webhookLogin}:${webhookPassword}`);
+  const received = Buffer.from(decoded);
+  return expected.length === received.length && crypto.timingSafeEqual(expected, received);
 }
 
 // Hostaway unified webhook — receives ALL event types on one URL
