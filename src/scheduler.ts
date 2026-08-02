@@ -1,24 +1,454 @@
 import cron from 'node-cron';
+import fs from 'fs';
+import path from 'path';
 import { properties, PropertyConfig } from './config';
-import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, getReservation, getConversation, Reservation, PoolHeatResult } from './hostaway';
+import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, getReservation, getConversation, sendConversationMessage, Reservation, PoolHeatResult } from './hostaway';
 import { getPoolStatus, setPoolHeat, turnOffPoolHeat, updatePoolScheduleHeatOn, updatePoolScheduleHeatOff } from './screenlogic';
 import { calculateHeaterStartTime } from './weather';
 import { alertHeaterAction, alertManualReminder, sendAlert } from './alerts';
 import { getTargetTempForStay } from './pricing';
+import { sendConfirmRequest } from './confirm';
+import { renderSmartTimingHtml } from './override';
 
 interface ScheduledEvent {
   reservationId: number;
   propertyName: string;
-  action: 'ON' | 'OFF' | 'RECALCULATE';
+  // SANITY_READ = pre-ON cold-pool check (panic-pull ON forward if pool is too
+  // cold to reach target by check-in at conservative rate). Independent of
+  // Open-Meteo, so it survives weather-API outages that could break RECALCULATE.
+  action: 'ON' | 'OFF' | 'RECALCULATE' | 'SANITY_READ';
   scheduledTime: Date;
   guestName: string;
   executed: boolean;
   targetTemp: number;
   heatDays?: number | null;
+  // Retry tracking — incremented on each handler attempt; if the handler throws
+  // and attempts < MAX_EXECUTOR_ATTEMPTS the event stays unexecuted so the
+  // next executor tick (every minute) re-fires it. Prevents transient API
+  // outages from silently dropping ON events (root cause of the 2026-05-02
+  // Pamela Taylor cold-pool incident — Open-Meteo 502 with no retry).
+  attempts?: number;
+}
+
+const MAX_EXECUTOR_ATTEMPTS = 5;
+
+// Persistence: PM2 restarts (deploys, OOM, crashes) used to wipe the in-memory
+// schedule, silently dropping pending ON events. Now we round-trip to disk on
+// every mutation. File path overridable for tests; default lives next to the
+// repo on the prod box.
+const SCHEDULE_PERSIST_PATH =
+  process.env.SCHEDULE_PERSIST_PATH || path.join(process.cwd(), 'data', 'schedule.json');
+
+function persistEvents(): void {
+  try {
+    fs.mkdirSync(path.dirname(SCHEDULE_PERSIST_PATH), { recursive: true });
+    const serialized = scheduledEvents.map(e => ({
+      ...e,
+      scheduledTime: e.scheduledTime.toISOString(),
+    }));
+    fs.writeFileSync(SCHEDULE_PERSIST_PATH, JSON.stringify(serialized, null, 2));
+  } catch (err: any) {
+    console.error(`[Persist] Failed to write ${SCHEDULE_PERSIST_PATH}: ${err.message}`);
+  }
+}
+
+function loadEvents(): number {
+  try {
+    if (!fs.existsSync(SCHEDULE_PERSIST_PATH)) return 0;
+    const raw = fs.readFileSync(SCHEDULE_PERSIST_PATH, 'utf8');
+    const parsed = JSON.parse(raw) as Array<Omit<ScheduledEvent, 'scheduledTime'> & { scheduledTime: string }>;
+    scheduledEvents.length = 0;
+    for (const e of parsed) {
+      scheduledEvents.push({ ...e, scheduledTime: new Date(e.scheduledTime) });
+    }
+    return scheduledEvents.length;
+  } catch (err: any) {
+    console.error(`[Persist] Failed to load ${SCHEDULE_PERSIST_PATH}: ${err.message}`);
+    return 0;
+  }
+}
+
+// Confirm state: pendingConfirms / declinedReservations / undecidedReservations.
+// Same persistence rationale as the schedule — PM2 restarts no longer wipe
+// "Brady said NO to this guest" or "guest is still thinking" memory.
+const CONFIRM_STATE_PATH =
+  process.env.CONFIRM_STATE_PATH || path.join(process.cwd(), 'data', 'confirm-state.json');
+
+function persistConfirmState(): void {
+  try {
+    fs.mkdirSync(path.dirname(CONFIRM_STATE_PATH), { recursive: true });
+    const data = {
+      pendingConfirms: Array.from(pendingConfirms),
+      declinedReservations: Array.from(declinedReservations),
+      undecidedReservations: Array.from(undecidedReservations.entries()),
+    };
+    fs.writeFileSync(CONFIRM_STATE_PATH, JSON.stringify(data, null, 2));
+  } catch (err: any) {
+    console.error(`[Persist] Failed to write ${CONFIRM_STATE_PATH}: ${err.message}`);
+  }
+}
+
+function loadConfirmState(): { pending: number; declined: number; undecided: number } {
+  try {
+    if (!fs.existsSync(CONFIRM_STATE_PATH)) return { pending: 0, declined: 0, undecided: 0 };
+    const data = JSON.parse(fs.readFileSync(CONFIRM_STATE_PATH, 'utf8')) as {
+      pendingConfirms?: number[];
+      declinedReservations?: number[];
+      undecidedReservations?: Array<[number, { followupSentAt: string | null }]>;
+    };
+    pendingConfirms.clear();
+    declinedReservations.clear();
+    undecidedReservations.clear();
+    (data.pendingConfirms ?? []).forEach(id => pendingConfirms.add(id));
+    (data.declinedReservations ?? []).forEach(id => declinedReservations.add(id));
+    (data.undecidedReservations ?? []).forEach(([id, meta]) => undecidedReservations.set(id, meta));
+    return {
+      pending: pendingConfirms.size,
+      declined: declinedReservations.size,
+      undecided: undecidedReservations.size,
+    };
+  } catch (err: any) {
+    console.error(`[Persist] Failed to load ${CONFIRM_STATE_PATH}: ${err.message}`);
+    return { pending: 0, declined: 0, undecided: 0 };
+  }
 }
 
 // In-memory schedule (persisted to disk would be better for production)
 const scheduledEvents: ScheduledEvent[] = [];
+
+/**
+ * Add a scheduled event with dedup.
+ * Considers two events "the same" when (reservationId, action) match AND the
+ * scheduledTime is within 5 minutes. Prevents duplicates from racy scans.
+ */
+function addEvent(ev: ScheduledEvent): boolean {
+  const FIVE_MIN = 5 * 60 * 1000;
+  const dup = scheduledEvents.find(e =>
+    e.reservationId === ev.reservationId &&
+    e.action === ev.action &&
+    Math.abs(e.scheduledTime.getTime() - ev.scheduledTime.getTime()) < FIVE_MIN
+  );
+  if (dup) {
+    console.log(`[Dedup] Skipping duplicate ${ev.action} for reservation ${ev.reservationId} (${ev.guestName})`);
+    return false;
+  }
+  scheduledEvents.push(ev);
+  persistEvents();
+  return true;
+}
+
+/**
+ * Remove all unexecuted events of a given action for a reservation.
+ *
+ * Used when re-running smart timing (a fresh RECALCULATE may shift ON earlier
+ * or later by hours, beyond the addEvent dedup window) or when a SANITY_READ
+ * panic-pulls ON forward — we need to drop the stale future ON before adding
+ * the new one.
+ */
+function removeUnexecutedEvents(reservationId: number, action: ScheduledEvent['action']): number {
+  let removed = 0;
+  for (let i = scheduledEvents.length - 1; i >= 0; i--) {
+    const e = scheduledEvents[i];
+    if (e.reservationId === reservationId && e.action === action && !e.executed) {
+      scheduledEvents.splice(i, 1);
+      removed++;
+    }
+  }
+  if (removed > 0) persistEvents();
+  return removed;
+}
+
+/**
+ * Schedule recurring RECALCULATEs at fixed offsets BEFORE the planned ON.
+ *
+ * Each refresh re-reads pool temp + forecast and reschedules ON. The 2026-05-08
+ * Karen Hunter incident locked in a noon ON two days ahead and never
+ * re-evaluated when overnight cooling dropped the pool 11°F. This guarantees
+ * the schedule keeps tracking real conditions as ON approaches.
+ *
+ * Past offsets are silently skipped (e.g. on an in-window agreement detected
+ * <12h before ON, only T-6 may fire).
+ */
+function scheduleRecurringRecalcs(
+  reservation: Reservation,
+  property: PropertyConfig,
+  targetTemp: number,
+  heatDays: number | null,
+  onStartTime: Date
+): number {
+  removeUnexecutedEvents(reservation.id, 'RECALCULATE');
+  const now = new Date();
+  const offsetsBeforeOn = [24, 12]; // hours
+  let added = 0;
+  for (const off of offsetsBeforeOn) {
+    const t = new Date(onStartTime.getTime() - off * 60 * 60 * 1000);
+    if (t <= now || t >= onStartTime) continue;
+    const ok = addEvent({
+      reservationId: reservation.id,
+      propertyName: property.name,
+      action: 'RECALCULATE',
+      scheduledTime: t,
+      guestName: reservation.guestName,
+      executed: false,
+      targetTemp,
+      heatDays,
+    });
+    if (ok) added++;
+  }
+  return added;
+}
+
+/**
+ * Schedule a SANITY_READ 6h before the planned ON.
+ *
+ * Independent of Open-Meteo: only reads pool temp and applies a conservative
+ * 0.5°F/hr planning rate. If the pool can't reach target by check-in even at
+ * full power, we panic-pull ON forward to NOW and fire ⚠️ Cold-pool override.
+ *
+ * This is belt-and-suspenders alongside RECALCULATE — survives weather-API
+ * outages that could otherwise leave a stale ON in place.
+ */
+function scheduleSanityRead(
+  reservation: Reservation,
+  property: PropertyConfig,
+  targetTemp: number,
+  heatDays: number | null,
+  onStartTime: Date
+): boolean {
+  removeUnexecutedEvents(reservation.id, 'SANITY_READ');
+  const now = new Date();
+  const t = new Date(onStartTime.getTime() - 6 * 60 * 60 * 1000);
+  if (t <= now || t >= onStartTime) return false;
+  return addEvent({
+    reservationId: reservation.id,
+    propertyName: property.name,
+    action: 'SANITY_READ',
+    scheduledTime: t,
+    guestName: reservation.guestName,
+    executed: false,
+    targetTemp,
+    heatDays,
+  });
+}
+
+/**
+ * Bootstrap backfill: for every unexecuted future ON, ensure the T-24/T-12
+ * RECALCULATE + T-6 SANITY_READ safety events exist.
+ *
+ * Why this is needed: in-flight reservations whose ON was scheduled BEFORE the
+ * 2026-05-08 safety-rails rollout don't have these events on disk. Without
+ * backfill they'd run with the old "decide once, never re-evaluate" semantics
+ * — exactly the failure mode that caused the cold-pool incident.
+ *
+ * Idempotent — `scheduleRecurringRecalcs` / `scheduleSanityRead` clear any
+ * prior unexecuted versions before re-adding, so multiple boots don't dupe.
+ *
+ * Past offsets are skipped (e.g. ON in 4h → all of T-24/T-12/T-6 are past →
+ * nothing added; that reservation is too close to ON for safety rails to help
+ * and a fresh smart-timing run would just re-pick "start now" anyway).
+ */
+async function bootstrapBackfillSafetyEvents(): Promise<{
+  recalcsAdded: number;
+  sanityAdded: number;
+  reservationsCovered: number;
+}> {
+  const now = new Date();
+  const futureOns = scheduledEvents.filter(
+    e => e.action === 'ON' && !e.executed && e.scheduledTime > now
+  );
+
+  let recalcsAdded = 0;
+  let sanityAdded = 0;
+  const seen = new Set<number>();
+
+  for (const onEvent of futureOns) {
+    if (seen.has(onEvent.reservationId)) continue;
+    seen.add(onEvent.reservationId);
+
+    const property = properties.find(p => p.name === onEvent.propertyName);
+    if (!property) continue;
+
+    let reservation: Reservation;
+    try {
+      reservation = await getReservation(onEvent.reservationId);
+    } catch (err: any) {
+      console.error(`[Bootstrap] Failed to fetch reservation ${onEvent.reservationId} (${onEvent.guestName}): ${err.message}`);
+      continue;
+    }
+
+    // heatDays wasn't carried on legacy ON events. The existing OFF event sits
+    // unchanged on disk (scheduleSmartTiming only adds OFF if absent), so a
+    // null heatDays here can't shift the off time. Worst case: a partial-stay
+    // alert email reads "full stay" — cosmetic only.
+    const heatDays = onEvent.heatDays ?? null;
+
+    recalcsAdded += scheduleRecurringRecalcs(
+      reservation, property, onEvent.targetTemp, heatDays, onEvent.scheduledTime
+    );
+    if (scheduleSanityRead(reservation, property, onEvent.targetTemp, heatDays, onEvent.scheduledTime)) {
+      sanityAdded++;
+    }
+  }
+
+  return { recalcsAdded, sanityAdded, reservationsCovered: seen.size };
+}
+
+/** One-time sweep of the in-memory events to remove any existing dupes. */
+export function dedupeExistingEvents(): number {
+  const FIVE_MIN = 5 * 60 * 1000;
+  const seen: ScheduledEvent[] = [];
+  let removed = 0;
+  for (const e of scheduledEvents) {
+    const dup = seen.find(s =>
+      s.reservationId === e.reservationId &&
+      s.action === e.action &&
+      Math.abs(s.scheduledTime.getTime() - e.scheduledTime.getTime()) < FIVE_MIN
+    );
+    if (dup) { removed++; continue; }
+    seen.push(e);
+  }
+  scheduledEvents.length = 0;
+  scheduledEvents.push(...seen);
+  if (removed > 0) persistEvents();
+  return removed;
+}
+
+/** Force a reservation into "agreed" state (used by /confirm email callback). */
+export async function forceAgreement(reservationId: number, heatDays: number | null): Promise<boolean> {
+  const reservation = await getReservation(reservationId);
+  const property = getPropertyForListing(reservation.listingMapId);
+  if (!property) return false;
+  await scheduleForReservation(reservation, property, { status: 'agreed', heatDays });
+  pendingConfirms.delete(reservationId);
+  declinedReservations.delete(reservationId);
+  undecidedReservations.delete(reservationId);
+  persistConfirmState();
+  return true;
+}
+
+/** Mark a reservation as declined (used by /confirm NO). */
+export function markDeclined(reservationId: number): void {
+  pendingConfirms.delete(reservationId);
+  declinedReservations.add(reservationId);
+  persistConfirmState();
+}
+
+/**
+ * Mark a reservation as "guest undecided" (used by /confirm UNDECIDED).
+ * Stays in pendingConfirms (so Brady doesn't get re-emailed every scan), but
+ * tracked separately so the daily follow-up cron can prompt the guest 5 days
+ * before arrival via Hostaway.
+ */
+export function markUndecided(reservationId: number): void {
+  undecidedReservations.set(reservationId, { followupSentAt: null });
+  declinedReservations.delete(reservationId);
+  // keep in pendingConfirms — already-emailed Brady, no re-spam
+  persistConfirmState();
+}
+
+/**
+ * Push the future heater-ON event for a reservation later by `hours`.
+ * Used by the /delay-on email override link.
+ *
+ * - Anchor is the CURRENT pending ON time (so two clicks of "Delay 12h" =
+ *   24h total, not 12h).
+ * - Capped at `checkIn − 2h` so we never delay past the safety buffer the
+ *   smart-timing model itself enforces.
+ * - Rebuilds the T-24/T-12 RECALCULATE and T-6 SANITY_READ staircase relative
+ *   to the new ON, so the safety rails stay aligned.
+ * - Sends a confirmation alert (text + plain — no override buttons on the
+ *   confirmation, to avoid recursive override chains).
+ */
+export async function delayHeaterOn(
+  reservationId: number,
+  hours: number,
+): Promise<{ ok: boolean; message: string }> {
+  const now = new Date();
+  const futureOn = scheduledEvents.find(
+    e => e.reservationId === reservationId && e.action === 'ON' && !e.executed && e.scheduledTime > now,
+  );
+  if (!futureOn) {
+    return { ok: false, message: `No pending heater ON event for reservation ${reservationId}.` };
+  }
+  const property = properties.find(p => p.name === futureOn.propertyName);
+  if (!property) return { ok: false, message: `Unknown property: ${futureOn.propertyName}` };
+
+  let reservation: Reservation;
+  try {
+    reservation = await getReservation(reservationId);
+  } catch (err: any) {
+    return { ok: false, message: `Could not load reservation: ${err.message}` };
+  }
+
+  const checkIn = zonedDate(reservation.arrivalDate, property.checkInHour, 0, property.timezone);
+  const minBufferMs = 2 * 60 * 60 * 1000;
+  const maxAllowed = new Date(checkIn.getTime() - minBufferMs);
+  const proposed = new Date(futureOn.scheduledTime.getTime() + hours * 60 * 60 * 1000);
+  const clamped = proposed > maxAllowed;
+  const newOn = clamped ? maxAllowed : proposed;
+
+  if (newOn.getTime() <= now.getTime()) {
+    return { ok: false, message: 'Delay would push ON into the past or no usable window remains before check-in.' };
+  }
+
+  const oldOn = futureOn.scheduledTime;
+  const heatDays = futureOn.heatDays ?? null;
+  const targetTemp = futureOn.targetTemp;
+  const guestName = futureOn.guestName;
+
+  removeUnexecutedEvents(reservationId, 'ON');
+  addEvent({
+    reservationId,
+    propertyName: property.name,
+    action: 'ON',
+    scheduledTime: newOn,
+    guestName,
+    executed: false,
+    targetTemp,
+    heatDays,
+  });
+
+  scheduleRecurringRecalcs(reservation, property, targetTemp, heatDays, newOn);
+  scheduleSanityRead(reservation, property, targetTemp, heatDays, newOn);
+
+  const fmt = (d: Date) => d.toLocaleString('en-US', { timeZone: property.timezone });
+  const hoursToCheckIn = (checkIn.getTime() - newOn.getTime()) / (1000 * 60 * 60);
+  console.log(
+    `[Override] delayHeaterOn r=${reservationId} (${guestName} / ${property.name}) ` +
+    `requested=+${hours}h applied=${clamped ? 'clamped' : 'as-requested'} ` +
+    `oldOn=${oldOn.toISOString()} newOn=${newOn.toISOString()} ` +
+    `hoursToCheckInAfter=${hoursToCheckIn.toFixed(1)}`,
+  );
+
+  await sendAlert(
+    clamped ? 'warning' : 'info',
+    `Heater ON delayed — ${property.name}`,
+    [
+      `Guest: ${guestName}`,
+      `Stay: ${reservation.arrivalDate} → ${reservation.departureDate}`,
+      `Target: ${targetTemp}°F`,
+      `Requested delay: +${hours}h${clamped ? ' (clamped — see below)' : ''}`,
+      `Old heater ON: ${fmt(oldOn)}`,
+      `New heater ON: ${fmt(newOn)}`,
+      `Check-in: ${fmt(checkIn)} (${hoursToCheckIn.toFixed(1)}h after new ON)`,
+      ``,
+      `Safety re-checks rescheduled: T-24h + T-12h RECALCULATE, T-6h SANITY_READ.`,
+      clamped
+        ? `Note: requested delay would have left less than 2h before check-in; clamped to check-in − 2h.`
+        : ``,
+    ].filter(Boolean).join('\n'),
+  );
+
+  return { ok: true, message: `Heater ON delayed to ${fmt(newOn)} (${clamped ? 'clamped' : 'as requested'}).` };
+}
+
+// Tracks reservations we've already emailed a confirm for, so we don't spam.
+export const pendingConfirms = new Set<number>();
+// Reservations Brady said NO to.
+export const declinedReservations = new Set<number>();
+// Reservations Brady said "guest undecided" on. Value tracks whether we've
+// already sent the 5-day-before-arrival Hostaway follow-up.
+export const undecidedReservations = new Map<number, { followupSentAt: string | null }>();
 
 function getPropertyForListing(listingId: number): PropertyConfig | undefined {
   return properties.find(p => p.hostawayListingId === listingId);
@@ -159,13 +589,13 @@ async function scheduleForReservation(
 
   if (hoursUntilCheckIn <= 72) {
     // Check-in is within 72 hours — calculate smart timing NOW
-    await scheduleSmartTiming(reservation, property, targetTemp, checkIn, heaterOffTime, heatDaysLabel);
+    await scheduleSmartTiming(reservation, property, targetTemp, checkIn, heaterOffTime, heatDaysLabel, heatResult.heatDays);
   } else {
     // Check-in is far away — schedule a RECALCULATE event for 72h before check-in.
     // No pool temp reads, no weather API calls. Just note the agreement.
     const recalcTime = new Date(checkIn.getTime() - 72 * 60 * 60 * 1000);
 
-    scheduledEvents.push({
+    addEvent({
       reservationId: reservation.id,
       propertyName: property.name,
       action: 'RECALCULATE',
@@ -177,7 +607,7 @@ async function scheduleForReservation(
     });
 
     // Always schedule heater OFF now (doesn't need smart timing)
-    scheduledEvents.push({
+    addEvent({
       reservationId: reservation.id,
       propertyName: property.name,
       action: 'OFF',
@@ -212,7 +642,8 @@ async function scheduleSmartTiming(
   targetTemp: number,
   checkIn: Date,
   heaterOffTime: Date,
-  heatDaysLabel: string
+  heatDaysLabel: string,
+  heatDays: number | null
 ) {
   if (property.poolSystem === 'screenlogic' && property.screenlogicGateway) {
     let currentPoolTemp: number | null = null;
@@ -223,11 +654,31 @@ async function scheduleSmartTiming(
       // Can't read temp — will estimate from air temp
     }
 
-    const { startTime, estimatedHours, avgAirTemp, clamped, shortfallHours } = await calculateHeaterStartTime(
+    const {
+      startTime, estimatedHours, avgAirTemp, clamped, shortfallHours,
+      poolTempAtOn, poolTempAtCheckIn,
+    } = await calculateHeaterStartTime(
       checkIn, targetTemp, currentPoolTemp, property.latitude, property.longitude
     );
 
-    scheduledEvents.push({
+    const gapF = currentPoolTemp != null ? Math.max(0, targetTemp - currentPoolTemp) : null;
+
+    // Greppable single-line stdout summary of the simulation inputs/outputs.
+    // Added after the 2026-05-08 Karen Hunter RCA: the alert email had this
+    // info, but PM2 logs did NOT — making post-incident root-causing painful.
+    console.log(
+      `[Smart] ${reservation.guestName} (${property.name}): ` +
+      `poolNow=${currentPoolTemp ?? 'unknown'}°F target=${targetTemp}°F ` +
+      `gap=${gapF?.toFixed(1) ?? '?'}°F avgAir=${avgAirTemp.toFixed(1)}°F ` +
+      `poolAtOn=${poolTempAtOn}°F poolAtCheckIn=${poolTempAtCheckIn}°F ` +
+      `heatHours=${estimatedHours} ON=${startTime.toISOString()} ` +
+      `checkIn=${checkIn.toISOString()} clamped=${clamped}`
+    );
+
+    // Replace any stale future ON for this reservation (a re-run RECALCULATE
+    // can shift ON by hours — beyond addEvent's 5-min dedup window).
+    removeUnexecutedEvents(reservation.id, 'ON');
+    addEvent({
       reservationId: reservation.id,
       propertyName: property.name,
       action: 'ON',
@@ -242,7 +693,7 @@ async function scheduleSmartTiming(
       e => e.reservationId === reservation.id && e.action === 'OFF' && !e.executed
     );
     if (!hasOff) {
-      scheduledEvents.push({
+      addEvent({
         reservationId: reservation.id,
         propertyName: property.name,
         action: 'OFF',
@@ -253,15 +704,25 @@ async function scheduleSmartTiming(
       });
     }
 
-    // Late-detection warning: if we had to clamp the start time to "now",
-    // the pool may not reach target by check-in. Surface it on the alert.
-    const alertLevel = clamped ? 'warning' : 'info';
+    // Schedule the next refresh + sanity check based on the new ON time.
+    // Each call clears the prior set, so re-running smart-timing keeps the
+    // T-24/T-12/T-6 staircase aligned with the current ON (not stale offsets).
+    scheduleRecurringRecalcs(reservation, property, targetTemp, heatDays, startTime);
+    scheduleSanityRead(reservation, property, targetTemp, heatDays, startTime);
+
+    // Alert framing:
+    //   clamped → "⚠️ Heat compressed" (sim says we won't make target)
+    //   gap >8°F (but not clamped) → "⚠️ Large heat gap — verify"
+    //   else → "Heat smart-timed" (informational)
+    const largeGap = gapF != null && gapF > 8;
+    const alertLevel = clamped || largeGap ? 'warning' : 'info';
     const alertSubject = clamped
       ? `⚠️ Heat compressed — ${property.name}`
+      : largeGap
+      ? `⚠️ Large heat gap — ${property.name}`
       : `Heat smart-timed — ${property.name}`;
 
     const hoursUntilCheckIn = (checkIn.getTime() - startTime.getTime()) / (1000 * 60 * 60);
-    const gapF = currentPoolTemp != null ? Math.max(0, targetTemp - currentPoolTemp) : null;
 
     const lines = [
       `Guest: ${reservation.guestName}`,
@@ -269,23 +730,31 @@ async function scheduleSmartTiming(
       `Heat duration: ${heatDaysLabel}`,
       `Target: ${targetTemp}°F`,
       `Current pool temp: ${currentPoolTemp ?? 'unknown'}°F`,
+      `Modeled pool temp at heater-ON: ${poolTempAtOn}°F (after idle cooling)`,
+      `Modeled pool temp at check-in: ${poolTempAtCheckIn}°F`,
       `Avg air temp forecast: ${avgAirTemp.toFixed(1)}°F`,
       `Heater ON: ${startTime.toLocaleString('en-US', { timeZone: property.timezone })} (${estimatedHours}h to heat)`,
       `Heater OFF: ${heaterOffTime.toLocaleString('en-US', { timeZone: property.timezone })}`,
     ];
     if (clamped) {
       lines.push('');
-      lines.push(`⚠️ LATE DETECTION: ideal start was ${shortfallHours.toFixed(1)}h ago.`);
+      lines.push(`⚠️ NOT ON TRACK: even starting now, modeled check-in temp is ${poolTempAtCheckIn}°F (target ${targetTemp}°F).`);
       lines.push(`Only ${hoursUntilCheckIn.toFixed(1)}h until check-in at ${checkIn.toLocaleString('en-US', { timeZone: property.timezone })}.`);
       if (gapF != null) {
-        lines.push(`Need ${gapF.toFixed(1)}°F of heat-up; at ~1°F/hr that needs ${(gapF + 2).toFixed(0)}h including buffer.`);
+        lines.push(`Need ${gapF.toFixed(1)}°F of heat-up; at conservative 0.5°F/hr that's ${(gapF / 0.5 + 2).toFixed(0)}h including buffer.`);
       }
+      lines.push(`Estimated shortfall vs ideal: ${shortfallHours.toFixed(1)}h.`);
       lines.push(`Pool may not reach ${targetTemp}°F by guest arrival. Consider manual intervention.`);
+    } else if (largeGap) {
+      lines.push('');
+      lines.push(`⚠️ LARGE GAP: pool is ${gapF!.toFixed(1)}°F below target. Sim says we'll make it, but verify the plan looks reasonable.`);
     }
 
-    await sendAlert(alertLevel,
+    await sendAlert(
+      alertLevel,
       alertSubject,
-      lines.join('\n')
+      lines.join('\n'),
+      renderSmartTimingHtml(alertSubject, lines, reservation.id, alertLevel),
     );
   } else {
     // IntelliConnect — smart reminder timing
@@ -299,7 +768,7 @@ async function scheduleSmartTiming(
       reminderTime = new Date(checkIn.getTime() - 24 * 60 * 60 * 1000);
     }
 
-    scheduledEvents.push({
+    addEvent({
       reservationId: reservation.id,
       propertyName: property.name,
       action: 'ON',
@@ -313,7 +782,7 @@ async function scheduleSmartTiming(
       e => e.reservationId === reservation.id && e.action === 'OFF' && !e.executed
     );
     if (!hasOff) {
-      scheduledEvents.push({
+      addEvent({
         reservationId: reservation.id,
         propertyName: property.name,
         action: 'OFF',
@@ -349,117 +818,280 @@ async function executeScheduledEvents() {
     if (event.executed) continue;
     if (event.scheduledTime > now) continue;
 
-    event.executed = true;
     const property = properties.find(p => p.name === event.propertyName);
 
     if (!property) {
       await sendAlert('error', `Unknown property: ${event.propertyName}`, 'Could not find property config.');
+      event.executed = true; // unrecoverable — config issue, no point retrying
       continue;
     }
+
+    event.attempts = (event.attempts ?? 0) + 1;
+    let succeeded = false;
 
     // RECALCULATE: 72h before check-in, now do the smart timing
     if (event.action === 'RECALCULATE') {
       try {
-        // Find the reservation to get dates
+        try {
+          // Primary path: smart timing (weather-driven heat-up simulation)
+          const reservation = await getReservation(event.reservationId);
+          const checkIn = zonedDate(reservation.arrivalDate, property.checkInHour, 0, property.timezone);
+          const heaterOffTime = calculateHeaterOffTime(
+            reservation.arrivalDate, reservation.departureDate, event.heatDays ?? null, property.timezone
+          );
+          const heatDaysLabel = event.heatDays == null
+            ? 'full stay'
+            : `${event.heatDays} day${event.heatDays > 1 ? 's' : ''}`;
+
+          await scheduleSmartTiming(reservation, property, event.targetTemp, checkIn, heaterOffTime, heatDaysLabel, event.heatDays ?? null);
+        } catch (smartErr: any) {
+          // Fallback path: smart timing failed (typically: Open-Meteo down after
+          // retries). Schedule a "dumb safe" ON 24h before check-in (or NOW if
+          // check-in is closer than 24h). If the fallback ALSO throws (e.g.,
+          // Hostaway is down), the outer catch leaves the event unexecuted so
+          // the next executor tick retries — up to MAX_EXECUTOR_ATTEMPTS.
+          const reservation = await getReservation(event.reservationId);
+          const checkIn = zonedDate(reservation.arrivalDate, property.checkInHour, 0, property.timezone);
+          const heaterOffTime = calculateHeaterOffTime(
+            reservation.arrivalDate, reservation.departureDate, event.heatDays ?? null, property.timezone
+          );
+          const fallbackStart = new Date(Math.max(now.getTime(), checkIn.getTime() - 24 * 60 * 60 * 1000));
+
+          addEvent({
+            reservationId: reservation.id,
+            propertyName: property.name,
+            action: 'ON',
+            scheduledTime: fallbackStart,
+            guestName: reservation.guestName,
+            executed: false,
+            targetTemp: event.targetTemp,
+          });
+
+          const hasOff = scheduledEvents.some(
+            e => e.reservationId === reservation.id && e.action === 'OFF' && !e.executed
+          );
+          if (!hasOff) {
+            addEvent({
+              reservationId: reservation.id,
+              propertyName: property.name,
+              action: 'OFF',
+              scheduledTime: heaterOffTime,
+              guestName: reservation.guestName,
+              executed: false,
+              targetTemp: event.targetTemp,
+            });
+          }
+
+          await sendAlert('warning',
+            `⚠️ Heat fallback scheduled — ${property.name}`,
+            [
+              `Smart timing failed: ${smartErr.message}`,
+              ``,
+              `Using fallback: heater ON 24h before check-in (no weather/temp simulation).`,
+              `Guest: ${event.guestName}`,
+              `Stay: ${reservation.arrivalDate} → ${reservation.departureDate}`,
+              `Target: ${event.targetTemp}°F`,
+              `Heater ON: ${fallbackStart.toLocaleString('en-US', { timeZone: property.timezone })}`,
+              `Heater OFF: ${heaterOffTime.toLocaleString('en-US', { timeZone: property.timezone })}`,
+              ``,
+              `Pool may run cooler than target. Consider checking actual temp before guest arrives.`,
+            ].join('\n')
+          );
+        }
+        succeeded = true;
+      } catch (err: any) {
+        console.error(`[Executor] RECALCULATE for ${event.guestName} (${property.name}) attempt ${event.attempts} threw: ${err.message}`);
+      }
+    } else if (event.action === 'SANITY_READ') {
+      // Pre-ON cold-pool check, 6h before scheduled ON. Reads pool temp only —
+      // no Open-Meteo dependency — so it survives weather-API outages. If the
+      // pool can't reach target by check-in even at conservative 0.5°F/hr, we
+      // panic-pull ON forward to NOW and fire ⚠️ Cold-pool override. Sister
+      // mechanism to RECALCULATE; together they guard against the 2026-05-08
+      // failure mode (stale ON time vs. drifted pool temp).
+      try {
         const reservation = await getReservation(event.reservationId);
         const checkIn = zonedDate(reservation.arrivalDate, property.checkInHour, 0, property.timezone);
-        const heaterOffTime = calculateHeaterOffTime(
-          reservation.arrivalDate, reservation.departureDate, event.heatDays ?? null, property.timezone
-        );
-        const heatDaysLabel = event.heatDays == null
-          ? 'full stay'
-          : `${event.heatDays} day${event.heatDays > 1 ? 's' : ''}`;
+        const hoursToCheckIn = (checkIn.getTime() - now.getTime()) / (1000 * 60 * 60);
 
-        await scheduleSmartTiming(reservation, property, event.targetTemp, checkIn, heaterOffTime, heatDaysLabel);
-      } catch (err: any) {
-        await sendAlert('error', `Recalculate failed — ${property.name}`, `Guest: ${event.guestName}\nError: ${err.message}`);
-      }
-      continue;
-    }
-
-    const heaterAction = event.action as 'ON' | 'OFF';
-
-    if (property.poolSystem === 'screenlogic' && property.screenlogicGateway) {
-      // Automated control.
-      // IMPORTANT: update the schedule FIRST, then set the body. The Pentair
-      // controller periodically re-syncs the pool body's heat settings from the
-      // active schedule. If we set the body first, the controller can undo it
-      // before we update the schedule — leaving "schedule ON, body OFF".
-      try {
-        // Step 1: Update the Pentair controller's built-in schedule
-        try {
-          const schedResult = heaterAction === 'ON'
-            ? await updatePoolScheduleHeatOn(property.screenlogicGateway, event.targetTemp)
-            : await updatePoolScheduleHeatOff(property.screenlogicGateway);
-          if (schedResult.success) {
-            console.log(`[Schedule] ${schedResult.message}`);
-          } else {
-            console.error(`[Schedule] ${schedResult.message}`);
-            await sendAlert('warning', `Schedule update failed — ${property.name}`, schedResult.message);
+        let poolTemp: number | null = null;
+        if (property.poolSystem === 'screenlogic' && property.screenlogicGateway) {
+          try {
+            const status = await getPoolStatus(property.screenlogicGateway);
+            poolTemp = status.poolTemp;
+          } catch {
+            // ignore — handled below
           }
-        } catch (schedErr: any) {
-          console.error(`[Schedule] Error for ${property.name}: ${schedErr.message}`);
-          await sendAlert('warning', `Schedule update error — ${property.name}`, schedErr.message);
         }
 
-        // Step 2: Set pool body heat mode (now safe — schedule already agrees)
-        let result;
-        if (heaterAction === 'ON') {
-          result = await setPoolHeat(property.screenlogicGateway, event.targetTemp);
+        if (poolTemp == null) {
+          console.log(`[Sanity] ${event.guestName} (${property.name}): pool temp unavailable, skipping`);
+          succeeded = true;
         } else {
-          result = await turnOffPoolHeat(property.screenlogicGateway);
-        }
+          const gap = event.targetTemp - poolTemp;
+          const CONSERVATIVE_RATE = 0.5; // °F/hr — matches netHeatingRate floor
+          const SAFETY_BUFFER = 1; // hour
+          const hoursNeeded = gap > 0 ? gap / CONSERVATIVE_RATE + SAFETY_BUFFER : 0;
+          const onTrack = hoursNeeded <= hoursToCheckIn;
 
-        await alertHeaterAction(
-          property.name,
-          heaterAction,
-          result.success,
-          result.message,
-          event.guestName
-        );
+          console.log(
+            `[Sanity] ${event.guestName} (${property.name}): ` +
+            `poolT=${poolTemp}°F target=${event.targetTemp}°F gap=${gap.toFixed(1)}°F ` +
+            `hoursToCheckIn=${hoursToCheckIn.toFixed(1)}h hoursNeeded≤${hoursNeeded.toFixed(1)}h ` +
+            `onTrack=${onTrack}`
+          );
 
-        // If failed, retry once after 5 minutes
-        if (!result.success) {
-          setTimeout(async () => {
-            try {
-              // Retry schedule first, then body (same order)
-              try {
-                const schedRetry = heaterAction === 'ON'
-                  ? await updatePoolScheduleHeatOn(property.screenlogicGateway!, event.targetTemp)
-                  : await updatePoolScheduleHeatOff(property.screenlogicGateway!);
-                if (schedRetry.success) {
-                  console.log(`[Schedule] RETRY: ${schedRetry.message}`);
-                } else {
-                  console.error(`[Schedule] RETRY failed: ${schedRetry.message}`);
-                }
-              } catch (schedErr: any) {
-                console.error(`[Schedule] RETRY error: ${schedErr.message}`);
-              }
+          if (!onTrack) {
+            // Panic-pull: replace any future ON with one scheduled at NOW.
+            removeUnexecutedEvents(event.reservationId, 'ON');
+            addEvent({
+              reservationId: event.reservationId,
+              propertyName: property.name,
+              action: 'ON',
+              scheduledTime: now,
+              guestName: event.guestName,
+              executed: false,
+              targetTemp: event.targetTemp,
+            });
 
-              const retry = event.action === 'ON'
-                ? await setPoolHeat(property.screenlogicGateway!, event.targetTemp)
-                : await turnOffPoolHeat(property.screenlogicGateway!);
-
-              await alertHeaterAction(
-                property.name,
-                heaterAction,
-                retry.success,
-                `RETRY: ${retry.message}`,
-                event.guestName
-              );
-            } catch (err: any) {
-              await alertHeaterAction(property.name, heaterAction, false, `RETRY FAILED: ${err.message}`, event.guestName);
-            }
-          }, 5 * 60 * 1000);
+            await sendAlert('warning',
+              `⚠️ Cold-pool override — ${property.name}`,
+              [
+                `T-6h sanity check failed.`,
+                ``,
+                `Guest: ${event.guestName}`,
+                `Stay: ${reservation.arrivalDate} → ${reservation.departureDate}`,
+                `Pool temp: ${poolTemp}°F`,
+                `Target: ${event.targetTemp}°F`,
+                `Hours until check-in: ${hoursToCheckIn.toFixed(1)}h`,
+                `Heat-up needed at conservative ${CONSERVATIVE_RATE}°F/hr: ${hoursNeeded.toFixed(1)}h`,
+                ``,
+                `Action: ON pulled forward to NOW. Pool may still run cool.`,
+                `Consider manual heater override or warning the guest.`,
+              ].join('\n')
+            );
+          }
+          succeeded = true;
         }
       } catch (err: any) {
-        await alertHeaterAction(property.name, event.action, false, err.message, event.guestName);
+        console.error(`[Executor] SANITY_READ for ${event.guestName} (${property.name}) attempt ${event.attempts} threw: ${err.message}`);
       }
     } else {
-      // IntelliConnect — send reminder
-      const checkTime = event.scheduledTime.toLocaleString('en-US', { timeZone: property.timezone });
-      await alertManualReminder(property.name, heaterAction, event.guestName, checkTime);
+      // ON/OFF: execute heater action (existing logic has its own setTimeout
+      // retry for screenlogic transients; outer attempt counter guards against
+      // unhandled exceptions taking the event out of rotation forever).
+      try {
+        await executeHeaterAction(event, property);
+        succeeded = true;
+      } catch (err: any) {
+        console.error(`[Executor] ${event.action} for ${event.guestName} (${property.name}) attempt ${event.attempts} threw: ${err.message}`);
+      }
     }
+
+    if (succeeded) {
+      event.executed = true;
+      persistEvents();
+    } else if (event.attempts >= MAX_EXECUTOR_ATTEMPTS) {
+      event.executed = true;
+      persistEvents();
+      await sendAlert('error',
+        `Event abandoned after ${MAX_EXECUTOR_ATTEMPTS} attempts — ${property.name}`,
+        `${event.action} for ${event.guestName} failed every time. MANUAL ACTION REQUIRED.`
+      );
+    }
+    continue;
+  }
+}
+
+/**
+ * Execute a single ON/OFF heater action. Extracted from the executor so the
+ * top-level retry logic can wrap it cleanly. Throws on unhandled errors;
+ * known-failure paths (heater unreachable, screenlogic timeout) are surfaced
+ * via alertHeaterAction and do NOT throw — the existing in-process setTimeout
+ * retry handles those without needing the outer cron-level retry.
+ */
+async function executeHeaterAction(event: ScheduledEvent, property: PropertyConfig) {
+  const heaterAction = event.action as 'ON' | 'OFF';
+
+  if (property.poolSystem === 'screenlogic' && property.screenlogicGateway) {
+    // Automated control.
+    // IMPORTANT: update the schedule FIRST, then set the body. The Pentair
+    // controller periodically re-syncs the pool body's heat settings from the
+    // active schedule. If we set the body first, the controller can undo it
+    // before we update the schedule — leaving "schedule ON, body OFF".
+    try {
+      // Step 1: Update the Pentair controller's built-in schedule
+      try {
+        const schedResult = heaterAction === 'ON'
+          ? await updatePoolScheduleHeatOn(property.screenlogicGateway, event.targetTemp)
+          : await updatePoolScheduleHeatOff(property.screenlogicGateway);
+        if (schedResult.success) {
+          console.log(`[Schedule] ${schedResult.message}`);
+        } else {
+          console.error(`[Schedule] ${schedResult.message}`);
+          await sendAlert('warning', `Schedule update failed — ${property.name}`, schedResult.message);
+        }
+      } catch (schedErr: any) {
+        console.error(`[Schedule] Error for ${property.name}: ${schedErr.message}`);
+        await sendAlert('warning', `Schedule update error — ${property.name}`, schedErr.message);
+      }
+
+      // Step 2: Set pool body heat mode (now safe — schedule already agrees)
+      const result = heaterAction === 'ON'
+        ? await setPoolHeat(property.screenlogicGateway, event.targetTemp)
+        : await turnOffPoolHeat(property.screenlogicGateway);
+
+      await alertHeaterAction(
+        property.name,
+        heaterAction,
+        result.success,
+        result.message,
+        event.guestName
+      );
+
+      // If failed, retry once after 5 minutes (in-process; outer cron-level
+      // retry separately re-fires events that throw — these are different
+      // recovery layers).
+      if (!result.success) {
+        setTimeout(async () => {
+          try {
+            try {
+              const schedRetry = heaterAction === 'ON'
+                ? await updatePoolScheduleHeatOn(property.screenlogicGateway!, event.targetTemp)
+                : await updatePoolScheduleHeatOff(property.screenlogicGateway!);
+              if (schedRetry.success) {
+                console.log(`[Schedule] RETRY: ${schedRetry.message}`);
+              } else {
+                console.error(`[Schedule] RETRY failed: ${schedRetry.message}`);
+              }
+            } catch (schedErr: any) {
+              console.error(`[Schedule] RETRY error: ${schedErr.message}`);
+            }
+
+            const retry = heaterAction === 'ON'
+              ? await setPoolHeat(property.screenlogicGateway!, event.targetTemp)
+              : await turnOffPoolHeat(property.screenlogicGateway!);
+
+            await alertHeaterAction(
+              property.name,
+              heaterAction,
+              retry.success,
+              `RETRY: ${retry.message}`,
+              event.guestName
+            );
+          } catch (err: any) {
+            await alertHeaterAction(property.name, heaterAction, false, `RETRY FAILED: ${err.message}`, event.guestName);
+          }
+        }, 5 * 60 * 1000);
+      }
+    } catch (err: any) {
+      await alertHeaterAction(property.name, heaterAction, false, err.message, event.guestName);
+      throw err; // surface to outer retry counter
+    }
+  } else {
+    // IntelliConnect — send reminder
+    const checkTime = event.scheduledTime.toLocaleString('en-US', { timeZone: property.timezone });
+    await alertManualReminder(property.name, heaterAction, event.guestName, checkTime);
   }
 }
 
@@ -479,8 +1111,24 @@ export async function scanReservations() {
       if (!property) continue;
 
       const heatResult = await checkReservationHeat(res);
-      if (heatResult.status === 'agreed') {
+      if (heatResult.status === 'agreed' && declinedReservations.has(res.id)) {
+        // A human/explicit decline always wins over an 'agreed' classification.
+        // Guards against a parser false-positive re-scheduling heat after a NO.
+        console.log(`[Scan] ${res.guestName} (${res.id}) classified 'agreed' but is in declinedReservations — skipping.`);
+      } else if (heatResult.status === 'agreed') {
         await scheduleForReservation(res, property, heatResult);
+      } else if (heatResult.status === 'pending') {
+        // Host sent the offer, guest replied, but we can't classify.
+        // Email Brady with YES/NO links. Skip if we already asked or he said NO.
+        if (!pendingConfirms.has(res.id) && !declinedReservations.has(res.id)) {
+          try {
+            await sendConfirmRequest(res, property);
+            pendingConfirms.add(res.id);
+            persistConfirmState();
+          } catch (err: any) {
+            console.error(`[Confirm] Failed to send request for ${res.id}: ${err.message}`);
+          }
+        }
       }
     }
 
@@ -506,7 +1154,9 @@ export async function handleReservationWebhook(reservation: Reservation) {
   }
 
   const heatResult = await checkReservationHeat(reservation);
-  if (heatResult.status === 'agreed') {
+  if (heatResult.status === 'agreed' && declinedReservations.has(reservation.id)) {
+    console.log(`[Webhook] ${reservation.guestName} (${reservation.id}) classified 'agreed' but is in declinedReservations — skipping.`);
+  } else if (heatResult.status === 'agreed') {
     await scheduleForReservation(reservation, property, heatResult);
   }
 }
@@ -553,12 +1203,24 @@ export async function handleMessageWebhook(conversationId: number) {
     const heatResult = await checkReservationHeat(reservation);
     console.log(`[Message Webhook] Reservation ${reservationId} (${property.name}) — status: ${heatResult.status}`);
 
-    if (heatResult.status === 'agreed') {
+    if (heatResult.status === 'agreed' && declinedReservations.has(reservation.id)) {
+      console.log(`[Message Webhook] ${reservation.guestName} (${reservation.id}) classified 'agreed' but is in declinedReservations — skipping.`);
+    } else if (heatResult.status === 'agreed') {
       await scheduleForReservation(reservation, property, heatResult);
       await sendAlert('info',
         `Real-time detection — ${property.name}`,
         `Guest ${reservation.guestName} agreed to pool heat via message webhook (no polling delay).`
       );
+    } else if (heatResult.status === 'pending') {
+      if (!pendingConfirms.has(reservation.id) && !declinedReservations.has(reservation.id)) {
+        try {
+          await sendConfirmRequest(reservation, property);
+          pendingConfirms.add(reservation.id);
+          persistConfirmState();
+        } catch (err: any) {
+          console.error(`[Confirm] Failed to send request for ${reservation.id}: ${err.message}`);
+        }
+      }
     }
   } catch (err: any) {
     console.error(`[Message Webhook] Error processing conversation ${conversationId}: ${err.message}`);
@@ -578,6 +1240,76 @@ export function getScheduleState() {
 }
 
 /**
+ * Daily sweep over undecidedReservations: for any guest whose arrival is
+ * within 5 days and we haven't followed up yet, send a Hostaway message
+ * asking them to decide. Removes from pendingConfirms so the next scan
+ * re-emails Brady once the guest replies.
+ */
+async function sendUndecidedFollowups() {
+  const today = new Date();
+  for (const [reservationId, meta] of Array.from(undecidedReservations.entries())) {
+    if (meta.followupSentAt) continue;
+
+    let reservation;
+    try {
+      reservation = await getReservation(reservationId);
+    } catch (err: any) {
+      console.error(`[Followup] Could not load reservation ${reservationId}: ${err.message}`);
+      continue;
+    }
+
+    const arrival = new Date(reservation.arrivalDate + 'T00:00:00Z');
+    const daysUntil = Math.floor((arrival.getTime() - today.getTime()) / (24 * 60 * 60 * 1000));
+
+    if (daysUntil < 0) {
+      // Stay already started — prune from tracking.
+      undecidedReservations.delete(reservationId);
+      pendingConfirms.delete(reservationId);
+      persistConfirmState();
+      continue;
+    }
+
+    if (daysUntil > 5) continue; // too early — wait
+
+    // Guard: only nudge if pool heat is still genuinely unresolved. Re-scan
+    // the latest messages — guest may have replied with a yes/no since Brady
+    // clicked "Undecided," in which case we'd be pestering them about a
+    // decision they already made.
+    try {
+      const messages = await getConversationMessages(reservationId);
+      const heatStatus = scanMessagesForPoolHeat(messages);
+      if (heatStatus.status === 'agreed' || heatStatus.status === 'declined') {
+        console.log(`[Followup] Skipping ${reservation.guestName} (res ${reservationId}) — guest now ${heatStatus.status}, removing from undecided`);
+        undecidedReservations.delete(reservationId);
+        persistConfirmState();
+        continue;
+      }
+      if (heatStatus.status !== 'pending') {
+        // 'not_discussed' — guest never engaged with the offer at all; nothing to follow up on
+        continue;
+      }
+    } catch (err: any) {
+      console.error(`[Followup] Could not re-check messages for ${reservationId}: ${err.message}`);
+      continue;
+    }
+
+    try {
+      await sendConversationMessage(reservationId, 'Hi, did you decide about pool heat?');
+      meta.followupSentAt = new Date().toISOString();
+      pendingConfirms.delete(reservationId);
+      persistConfirmState();
+      console.log(`[Followup] Sent pool-heat reminder to ${reservation.guestName} (res ${reservationId}, arrives in ${daysUntil}d)`);
+    } catch (err: any) {
+      console.error(`[Followup] Failed to send to ${reservationId}: ${err.message}`);
+      await sendAlert('warning',
+        `Pool-heat followup failed — ${reservation.guestName}`,
+        `Reservation ${reservationId}\nError: ${err.message}\n\nManual reach-out may be needed.`
+      );
+    }
+  }
+}
+
+/**
  * Start the scheduler.
  */
 export function startScheduler() {
@@ -587,8 +1319,57 @@ export function startScheduler() {
   // Scan reservations every 4 hours
   cron.schedule('0 */4 * * *', scanReservations);
 
+  // Digest at 8 AM ET on Mondays and Fridays (deduped + fresh scan has run
+  // recently). Two checkpoints per week: Monday previews the upcoming weekend
+  // bookings; Friday recaps and flags anything still unresolved heading into
+  // peak guest-arrival days.
+  cron.schedule('0 8 * * 1,5', async () => {
+    try {
+      const { sendWeeklyDigest } = await import('./digest');
+      await sendWeeklyDigest();
+    } catch (err: any) {
+      console.error(`[Digest] Failed: ${err.message}`);
+    }
+  }, { timezone: 'America/New_York' });
+
+  // Daily 9 AM ET — nudge guests Brady marked "undecided" once we're 5 days out.
+  cron.schedule('0 9 * * *', async () => {
+    try {
+      await sendUndecidedFollowups();
+    } catch (err: any) {
+      console.error(`[Followup] Sweep failed: ${err.message}`);
+    }
+  }, { timezone: 'America/New_York' });
+
+  // Restore persisted state (PM2 restarts no longer drop ON events or
+  // forget which reservations Brady already classified).
+  const restored = loadEvents();
+  if (restored > 0) console.log(`[Persist] Restored ${restored} events from ${SCHEDULE_PERSIST_PATH}`);
+  const confirmCounts = loadConfirmState();
+  if (confirmCounts.pending + confirmCounts.declined + confirmCounts.undecided > 0) {
+    console.log(`[Persist] Restored confirm state: ${confirmCounts.pending} pending, ${confirmCounts.declined} declined, ${confirmCounts.undecided} undecided`);
+  }
+
+  // Dedupe on startup (defensive — scanner also uses addEvent's dedup now)
+  const removed = dedupeExistingEvents();
+  if (removed > 0) console.log(`[Dedup] Removed ${removed} duplicate events on startup`);
+
+  // Backfill T-24/T-12 RECALCULATE + T-6 SANITY_READ for any in-flight ON
+  // that predates the 2026-05-08 safety-rails rollout. Fire-and-forget so a
+  // slow Hostaway doesn't block startup; failures log and we move on.
+  bootstrapBackfillSafetyEvents()
+    .then(({ recalcsAdded, sanityAdded, reservationsCovered }) => {
+      if (reservationsCovered > 0) {
+        console.log(
+          `[Bootstrap] Backfilled safety events for ${reservationsCovered} reservation(s): ` +
+          `+${recalcsAdded} RECALCULATE, +${sanityAdded} SANITY_READ`
+        );
+      }
+    })
+    .catch((err: any) => console.error(`[Bootstrap] Safety backfill failed: ${err.message}`));
+
   // Initial scan on startup
   setTimeout(scanReservations, 5000);
 
-  console.log('Scheduler started: event check every 1min, reservation scan every 4h');
+  console.log('Scheduler started: events/1min, scan/4h, undecided-followup/1d 9am ET, Mon+Fri digest 8am ET');
 }

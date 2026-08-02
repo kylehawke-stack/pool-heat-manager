@@ -142,6 +142,43 @@ export async function deleteWebhook(webhookId: number): Promise<void> {
   }
 }
 
+/**
+ * Send a message in the guest's existing Hostaway conversation thread.
+ * Goes out via whatever channel the booking came in on (Airbnb / VRBO /
+ * Booking.com / direct). Field names match the incoming-message webhook
+ * payload — verified shape, but the first production call should be
+ * eyeballed in case Hostaway requires channel-specific extras (e.g.,
+ * bookingcomReplyOptions, airbnbThreadMessageId threading).
+ */
+export async function sendConversationMessage(reservationId: number, body: string): Promise<void> {
+  const conversations = await hostawayGet('/conversations', {
+    reservationId: String(reservationId),
+  });
+  if (!conversations || conversations.length === 0) {
+    throw new Error(`No conversation found for reservation ${reservationId}`);
+  }
+  const conversationId = conversations[0].id;
+  const communicationType = conversations[0].communicationType || 'channel';
+
+  const token = await getAccessToken();
+  const res = await fetch(`${config.hostaway.baseUrl}/conversations/${conversationId}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      body,
+      communicationType,
+      isIncoming: 0,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Hostaway send message failed: ${res.status} ${await res.text()}`);
+  }
+}
+
 export async function getConversationMessages(reservationId: number): Promise<any[]> {
   try {
     const conversations = await hostawayGet('/conversations', {
@@ -175,6 +212,10 @@ const POSITIVE_SIGNALS = [
   'looks good', 'pricing breakdown', 'payment has been sent',
   'love for the pool', 'would love for the pool',
   'if it\'s heated', // "if it's heated first thing Friday"
+  'avail the heated', 'will avail', 'gonna avail', // "we'll gonna avail the heated pool"
+  'send the payment', 'send payment link', 'payment link for', // "send the payment link for two days"
+  'send the link', 'send me the link', // variants of payment link ask
+  'heated pool for', 'heat the pool for', // "heated pool for the whole stay"
 ];
 
 const NEGATIVE_SIGNALS = [
@@ -183,6 +224,13 @@ const NEGATIVE_SIGNALS = [
   'not interested', 'no pool heat', "don't want", 'do not want',
   'too expensive', 'not worth', "we'll pass", "i'll pass", 'no heat',
   'without heat', 'not this time',
+  // Explicit "decided against it" phrasings. Without these, "we have decided
+  // not to heat the pool" matched NO negative ('not to heat' != 'no heat') and
+  // then tripped the 'please' POSITIVE signal from an unrelated sentence in the
+  // same message ("Please let us know about early check-in") → false 'agreed'.
+  // (Ana Ness / Elmwood, res 53236431, near-miss 2026-05-29.)
+  'not to heat', 'decided not to', 'not heating', 'decided against',
+  "won't be heating", 'rather not heat', 'no longer want', 'changed our mind',
 ];
 
 export interface PoolHeatResult {
@@ -293,7 +341,21 @@ export function scanMessagesForPoolHeat(messages: any[]): PoolHeatResult {
 
   if (!hostOfferedHeat) return { status: 'not_discussed', heatDays: null };
 
-  // Look for guest responses after the pool heat offer
+  // PRIMARY SIGNAL: host sent Airbnb payment-request link after the offer.
+  // Kyle only sends "airbnb.com/resolutions" / "sent the payment request"
+  // AFTER a guest has already verbally agreed, so this is deterministic.
+  const hostMessagesAfter = sorted.slice(lastOfferIndex + 1).filter(
+    m => m.isIncoming === 0 || m.senderType === 'host'
+  );
+  for (const msg of hostMessagesAfter) {
+    const body = (msg.body || '').toLowerCase();
+    if (body.includes('airbnb.com/resolutions') || body.includes('sent the payment request')) {
+      const heatDays = parseHeatDays(sorted, lastOfferIndex);
+      return { status: 'agreed', heatDays };
+    }
+  }
+
+  // Look for guest responses after the pool heat offer (fallback path)
   const responsesAfter = sorted.slice(lastOfferIndex + 1).filter(
     m => m.isIncoming === 1 || m.senderType === 'guest'
   );

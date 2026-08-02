@@ -1,4 +1,6 @@
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 dotenv.config();
 
 export interface PropertyConfig {
@@ -16,44 +18,23 @@ export interface PropertyConfig {
   timezone: string;
 }
 
-export const properties: PropertyConfig[] = [
-  {
-    name: 'Marshall House',
-    hostawayListingId: 111111,
-    poolSystem: 'screenlogic',
-    screenlogicGateway: 'Pentair: XX-XX-XX',
-    targetTemp: Number(process.env.DEFAULT_TARGET_TEMP) || 85,
-    latitude: 38.0,
-    longitude: -78.0,
-    checkInHour: 15,
-    checkOutHour: 10,
-    timezone: 'America/New_York',
-  },
-  {
-    name: 'Elmwood',
-    hostawayListingId: 222222,
-    poolSystem: 'screenlogic',
-    screenlogicGateway: 'Pentair: XX-XX-XX',
-    targetTemp: Number(process.env.DEFAULT_TARGET_TEMP) || 85,
-    latitude: 37.7,
-    longitude: -79.0,
-    checkInHour: 16,
-    checkOutHour: 11,
-    timezone: 'America/New_York',
-  },
-  {
-    // TODO: Brady to confirm which property has IntelliConnect
-    name: 'Boho Mountain',
-    hostawayListingId: 333333,
-    poolSystem: 'intelliconnect',
-    targetTemp: Number(process.env.DEFAULT_TARGET_TEMP) || 85,
-    latitude: 37.7,
-    longitude: -79.0,
-    checkInHour: 15,
-    checkOutHour: 10,
-    timezone: 'America/New_York',
-  },
-];
+// Property details (listing IDs, gateway names, coordinates) are private —
+// they live in properties.json, which is gitignored. Copy
+// properties.example.json to properties.json and fill in your own.
+const propertiesPath = path.resolve(process.cwd(), 'properties.json');
+if (!fs.existsSync(propertiesPath)) {
+  throw new Error(
+    'properties.json not found. Copy properties.example.json to properties.json and fill in your property details.'
+  );
+}
+
+type PropertyFile = Omit<PropertyConfig, 'targetTemp'> & { targetTemp?: number };
+const rawProperties: PropertyFile[] = JSON.parse(fs.readFileSync(propertiesPath, 'utf8'));
+
+export const properties: PropertyConfig[] = rawProperties.map((p) => ({
+  ...p,
+  targetTemp: p.targetTemp ?? (Number(process.env.DEFAULT_TARGET_TEMP) || 85),
+}));
 
 export const config = {
   hostaway: {
@@ -82,5 +63,9 @@ export const config = {
     port: Number(process.env.PORT) || 3100,
     webhookLogin: process.env.WEBHOOK_LOGIN || '',
     webhookPassword: process.env.WEBHOOK_PASSWORD || '',
+    publicUrl: process.env.PUBLIC_URL || '',
+  },
+  anthropic: {
+    apiKey: process.env.ANTHROPIC_API_KEY || '',
   },
 };

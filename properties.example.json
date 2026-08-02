@@ -1,0 +1,23 @@
+[
+  {
+    "name": "Lake House",
+    "hostawayListingId": 111111,
+    "poolSystem": "screenlogic",
+    "screenlogicGateway": "Pentair: XX-XX-XX",
+    "latitude": 38.0,
+    "longitude": -78.0,
+    "checkInHour": 15,
+    "checkOutHour": 10,
+    "timezone": "America/New_York"
+  },
+  {
+    "name": "Mountain Cabin",
+    "hostawayListingId": 222222,
+    "poolSystem": "intelliconnect",
+    "latitude": 37.0,
+    "longitude": -79.0,
+    "checkInHour": 16,
+    "checkOutHour": 11,
+    "timezone": "America/New_York"
+  }
+]

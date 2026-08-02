@@ -24,12 +24,13 @@ const LEVEL_EMOJI: Record<AlertLevel, string> = {
 export async function sendAlert(
   level: AlertLevel,
   subject: string,
-  body: string
+  body: string,
+  html?: string
 ): Promise<{ email: boolean; sms: boolean }> {
   const results = { email: false, sms: false };
   const prefix = LEVEL_EMOJI[level];
 
-  // Send SMS
+  // Send SMS — text only; HTML overrides don't apply here.
   if (twilioClient && config.alerts.phone) {
     try {
       const smsBody = `${prefix} Pool Heat: ${subject}\n\n${body}`.slice(0, 1600);
@@ -47,12 +48,14 @@ export async function sendAlert(
   // Send email via Resend
   if (resend && config.alerts.email) {
     try {
-      await resend.emails.send({
+      const payload: { from: string; to: string; subject: string; text: string; html?: string } = {
         from: config.resend.fromAddress,
         to: config.alerts.email,
         subject: `${prefix} Pool Heat: ${subject}`,
         text: body,
-      });
+      };
+      if (html) payload.html = html;
+      await resend.emails.send(payload as any);
       results.email = true;
     } catch (err: any) {
       console.error(`Email alert failed: ${err.message}`);

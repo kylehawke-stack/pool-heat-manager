@@ -1,26 +1,35 @@
 #!/bin/bash
-# Deploy pool-heat-manager to DigitalOcean
+# Deploy pool-heat-manager to a server via rsync + PM2
 # Usage: ./deploy.sh
 #
-# Prerequisites on the DO server (one-time):
+# Configure the target in .deploy.env (gitignored), e.g.:
+#   DEPLOY_SERVER=root@your.server.ip
+#   DEPLOY_REMOTE_DIR=/root/pool-heat-manager   # optional
+#
+# Prerequisites on the server (one-time):
 #   npm install -g pm2 tsx
 #   mkdir -p /root/pool-heat-manager/logs
 
 set -e
 
-SERVER="root@your.server.ip"
-REMOTE_DIR="/root/pool-heat-manager"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "${SCRIPT_DIR}/.deploy.env" ] && source "${SCRIPT_DIR}/.deploy.env"
 
-echo "=== Deploying pool-heat-manager ==="
+SERVER="${DEPLOY_SERVER:?Set DEPLOY_SERVER (e.g. root@your.server.ip) in .deploy.env or the environment}"
+REMOTE_DIR="${DEPLOY_REMOTE_DIR:-/root/pool-heat-manager}"
 
-# Sync files (exclude node_modules, .env stays on server)
+echo "=== Deploying pool-heat-manager to ${SERVER} ==="
+
+# Sync files (exclude node_modules; .env and data/ stay on server)
 echo "Syncing files..."
 rsync -avz --delete \
   --exclude 'node_modules' \
   --exclude '.env' \
+  --exclude '.deploy.env' \
   --exclude 'logs' \
   --exclude '.git' \
-  /home/kyle/projects/pool-heat-manager/ \
+  --exclude 'data' \
+  "${SCRIPT_DIR}/" \
   ${SERVER}:${REMOTE_DIR}/
 
 # Install deps and restart
