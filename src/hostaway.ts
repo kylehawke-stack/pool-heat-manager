@@ -142,42 +142,10 @@ export async function deleteWebhook(webhookId: number): Promise<void> {
   }
 }
 
-/**
- * Send a message in the guest's existing Hostaway conversation thread.
- * Goes out via whatever channel the booking came in on (Airbnb / VRBO /
- * Booking.com / direct). Field names match the incoming-message webhook
- * payload — verified shape, but the first production call should be
- * eyeballed in case Hostaway requires channel-specific extras (e.g.,
- * bookingcomReplyOptions, airbnbThreadMessageId threading).
- */
-export async function sendConversationMessage(reservationId: number, body: string): Promise<void> {
-  const conversations = await hostawayGet('/conversations', {
-    reservationId: String(reservationId),
-  });
-  if (!conversations || conversations.length === 0) {
-    throw new Error(`No conversation found for reservation ${reservationId}`);
-  }
-  const conversationId = conversations[0].id;
-  const communicationType = conversations[0].communicationType || 'channel';
-
-  const token = await getAccessToken();
-  const res = await fetch(`${config.hostaway.baseUrl}/conversations/${conversationId}/messages`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      body,
-      communicationType,
-      isIncoming: 0,
-    }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Hostaway send message failed: ${res.status} ${await res.text()}`);
-  }
-}
+// NOTE: this module is deliberately read-only against guest conversations.
+// `sendConversationMessage` was removed 2026-08-10 — the system never writes
+// to a guest thread. All outbound communication goes to Brady (email/SMS);
+// talking to guests is his call. Don't reintroduce a send path.
 
 export async function getConversationMessages(reservationId: number): Promise<any[]> {
   try {

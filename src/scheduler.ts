@@ -2,7 +2,7 @@ import cron from 'node-cron';
 import fs from 'fs';
 import path from 'path';
 import { properties, PropertyConfig } from './config';
-import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, getReservation, getConversation, sendConversationMessage, Reservation, PoolHeatResult } from './hostaway';
+import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, getReservation, getConversation, Reservation, PoolHeatResult } from './hostaway';
 import { getPoolStatus, setPoolHeat, turnOffPoolHeat, updatePoolScheduleHeatOn, updatePoolScheduleHeatOff } from './screenlogic';
 import { calculateHeaterStartTime } from './weather';
 import { alertHeaterAction, alertManualReminder, sendAlert } from './alerts';
@@ -68,7 +68,7 @@ function loadEvents(): number {
   }
 }
 
-// Confirm state: pendingConfirms / declinedReservations / undecidedReservations.
+// Confirm state: pendingConfirms / declinedReservations.
 // Same persistence rationale as the schedule — PM2 restarts no longer wipe
 // "Brady said NO to this guest" or "guest is still thinking" memory.
 const CONFIRM_STATE_PATH =
@@ -80,7 +80,6 @@ function persistConfirmState(): void {
     const data = {
       pendingConfirms: Array.from(pendingConfirms),
       declinedReservations: Array.from(declinedReservations),
-      undecidedReservations: Array.from(undecidedReservations.entries()),
     };
     fs.writeFileSync(CONFIRM_STATE_PATH, JSON.stringify(data, null, 2));
   } catch (err: any) {
@@ -88,28 +87,26 @@ function persistConfirmState(): void {
   }
 }
 
-function loadConfirmState(): { pending: number; declined: number; undecided: number } {
+function loadConfirmState(): { pending: number; declined: number } {
   try {
-    if (!fs.existsSync(CONFIRM_STATE_PATH)) return { pending: 0, declined: 0, undecided: 0 };
+    if (!fs.existsSync(CONFIRM_STATE_PATH)) return { pending: 0, declined: 0 };
+    // `undecidedReservations` was dropped in the 2026-08-10 guest-messaging
+    // removal; older state files still carry the key and are simply ignored.
     const data = JSON.parse(fs.readFileSync(CONFIRM_STATE_PATH, 'utf8')) as {
       pendingConfirms?: number[];
       declinedReservations?: number[];
-      undecidedReservations?: Array<[number, { followupSentAt: string | null }]>;
     };
     pendingConfirms.clear();
     declinedReservations.clear();
-    undecidedReservations.clear();
     (data.pendingConfirms ?? []).forEach(id => pendingConfirms.add(id));
     (data.declinedReservations ?? []).forEach(id => declinedReservations.add(id));
-    (data.undecidedReservations ?? []).forEach(([id, meta]) => undecidedReservations.set(id, meta));
     return {
       pending: pendingConfirms.size,
       declined: declinedReservations.size,
-      undecided: undecidedReservations.size,
     };
   } catch (err: any) {
     console.error(`[Persist] Failed to load ${CONFIRM_STATE_PATH}: ${err.message}`);
-    return { pending: 0, declined: 0, undecided: 0 };
+    return { pending: 0, declined: 0 };
   }
 }
 
@@ -321,7 +318,6 @@ export async function forceAgreement(reservationId: number, heatDays: number | n
   await scheduleForReservation(reservation, property, { status: 'agreed', heatDays });
   pendingConfirms.delete(reservationId);
   declinedReservations.delete(reservationId);
-  undecidedReservations.delete(reservationId);
   persistConfirmState();
   return true;
 }
@@ -335,14 +331,13 @@ export function markDeclined(reservationId: number): void {
 
 /**
  * Mark a reservation as "guest undecided" (used by /confirm UNDECIDED).
- * Stays in pendingConfirms (so Brady doesn't get re-emailed every scan), but
- * tracked separately so the daily follow-up cron can prompt the guest 5 days
- * before arrival via Hostaway.
+ * Purely a snooze: stays in pendingConfirms so Brady doesn't get re-emailed
+ * every scan. The system never contacts the guest — following up is Brady's
+ * call (see the 2026-08-10 removal of guest messaging).
  */
 export function markUndecided(reservationId: number): void {
-  undecidedReservations.set(reservationId, { followupSentAt: null });
+  pendingConfirms.add(reservationId);
   declinedReservations.delete(reservationId);
-  // keep in pendingConfirms — already-emailed Brady, no re-spam
   persistConfirmState();
 }
 
@@ -446,9 +441,6 @@ export async function delayHeaterOn(
 export const pendingConfirms = new Set<number>();
 // Reservations Brady said NO to.
 export const declinedReservations = new Set<number>();
-// Reservations Brady said "guest undecided" on. Value tracks whether we've
-// already sent the 5-day-before-arrival Hostaway follow-up.
-export const undecidedReservations = new Map<number, { followupSentAt: string | null }>();
 
 function getPropertyForListing(listingId: number): PropertyConfig | undefined {
   return properties.find(p => p.hostawayListingId === listingId);
@@ -1183,6 +1175,15 @@ export async function handleMessageWebhook(conversationId: number) {
       return;
     }
 
+    // Skip cancelled/inquiry reservations — a guest replying on a dead thread
+    // shouldn't produce a confirm email or scheduling (Stephanie Gillman, 8/10).
+    if (reservation.status !== 'modified') {
+      console.log(`[Message Webhook] Reservation ${reservationId} status '${reservation.status}' — not an active booking, skipping`);
+      pendingConfirms.delete(reservationId);
+      persistConfirmState();
+      return;
+    }
+
     // Skip checked-out reservations
     const today = new Date().toISOString().split('T')[0];
     if (reservation.departureDate <= today) {
@@ -1240,76 +1241,6 @@ export function getScheduleState() {
 }
 
 /**
- * Daily sweep over undecidedReservations: for any guest whose arrival is
- * within 5 days and we haven't followed up yet, send a Hostaway message
- * asking them to decide. Removes from pendingConfirms so the next scan
- * re-emails Brady once the guest replies.
- */
-async function sendUndecidedFollowups() {
-  const today = new Date();
-  for (const [reservationId, meta] of Array.from(undecidedReservations.entries())) {
-    if (meta.followupSentAt) continue;
-
-    let reservation;
-    try {
-      reservation = await getReservation(reservationId);
-    } catch (err: any) {
-      console.error(`[Followup] Could not load reservation ${reservationId}: ${err.message}`);
-      continue;
-    }
-
-    const arrival = new Date(reservation.arrivalDate + 'T00:00:00Z');
-    const daysUntil = Math.floor((arrival.getTime() - today.getTime()) / (24 * 60 * 60 * 1000));
-
-    if (daysUntil < 0) {
-      // Stay already started — prune from tracking.
-      undecidedReservations.delete(reservationId);
-      pendingConfirms.delete(reservationId);
-      persistConfirmState();
-      continue;
-    }
-
-    if (daysUntil > 5) continue; // too early — wait
-
-    // Guard: only nudge if pool heat is still genuinely unresolved. Re-scan
-    // the latest messages — guest may have replied with a yes/no since Brady
-    // clicked "Undecided," in which case we'd be pestering them about a
-    // decision they already made.
-    try {
-      const messages = await getConversationMessages(reservationId);
-      const heatStatus = scanMessagesForPoolHeat(messages);
-      if (heatStatus.status === 'agreed' || heatStatus.status === 'declined') {
-        console.log(`[Followup] Skipping ${reservation.guestName} (res ${reservationId}) — guest now ${heatStatus.status}, removing from undecided`);
-        undecidedReservations.delete(reservationId);
-        persistConfirmState();
-        continue;
-      }
-      if (heatStatus.status !== 'pending') {
-        // 'not_discussed' — guest never engaged with the offer at all; nothing to follow up on
-        continue;
-      }
-    } catch (err: any) {
-      console.error(`[Followup] Could not re-check messages for ${reservationId}: ${err.message}`);
-      continue;
-    }
-
-    try {
-      await sendConversationMessage(reservationId, 'Hi, did you decide about pool heat?');
-      meta.followupSentAt = new Date().toISOString();
-      pendingConfirms.delete(reservationId);
-      persistConfirmState();
-      console.log(`[Followup] Sent pool-heat reminder to ${reservation.guestName} (res ${reservationId}, arrives in ${daysUntil}d)`);
-    } catch (err: any) {
-      console.error(`[Followup] Failed to send to ${reservationId}: ${err.message}`);
-      await sendAlert('warning',
-        `Pool-heat followup failed — ${reservation.guestName}`,
-        `Reservation ${reservationId}\nError: ${err.message}\n\nManual reach-out may be needed.`
-      );
-    }
-  }
-}
-
-/**
  * Start the scheduler.
  */
 export function startScheduler() {
@@ -1332,22 +1263,13 @@ export function startScheduler() {
     }
   }, { timezone: 'America/New_York' });
 
-  // Daily 9 AM ET — nudge guests Brady marked "undecided" once we're 5 days out.
-  cron.schedule('0 9 * * *', async () => {
-    try {
-      await sendUndecidedFollowups();
-    } catch (err: any) {
-      console.error(`[Followup] Sweep failed: ${err.message}`);
-    }
-  }, { timezone: 'America/New_York' });
-
   // Restore persisted state (PM2 restarts no longer drop ON events or
   // forget which reservations Brady already classified).
   const restored = loadEvents();
   if (restored > 0) console.log(`[Persist] Restored ${restored} events from ${SCHEDULE_PERSIST_PATH}`);
   const confirmCounts = loadConfirmState();
-  if (confirmCounts.pending + confirmCounts.declined + confirmCounts.undecided > 0) {
-    console.log(`[Persist] Restored confirm state: ${confirmCounts.pending} pending, ${confirmCounts.declined} declined, ${confirmCounts.undecided} undecided`);
+  if (confirmCounts.pending + confirmCounts.declined > 0) {
+    console.log(`[Persist] Restored confirm state: ${confirmCounts.pending} pending, ${confirmCounts.declined} declined`);
   }
 
   // Dedupe on startup (defensive — scanner also uses addEvent's dedup now)
@@ -1371,5 +1293,5 @@ export function startScheduler() {
   // Initial scan on startup
   setTimeout(scanReservations, 5000);
 
-  console.log('Scheduler started: events/1min, scan/4h, undecided-followup/1d 9am ET, Mon+Fri digest 8am ET');
+  console.log('Scheduler started: events/1min, scan/4h, Mon+Fri digest 8am ET');
 }

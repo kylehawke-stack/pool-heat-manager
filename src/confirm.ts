@@ -14,7 +14,7 @@ function getSecret(): string {
 
 export interface ConfirmPayload {
   r: number;                            // reservationId
-  a: 'yes' | 'no' | 'undecided';        // answer; 'undecided' keeps in pending queue and triggers a 5-day-before-arrival followup
+  a: 'yes' | 'no' | 'undecided';        // answer; 'undecided' = snooze, keeps in pending queue and stops re-emailing Brady
   d: number | null;                     // heatDays (null = full stay; ignored when a='undecided' or 'no')
   e: number;                            // exp (unix ms)
 }
@@ -97,7 +97,7 @@ export async function sendConfirmRequest(reservation: Reservation, property: Pro
     <a href="${yes1}" style="background:#0369a1;color:#fff;padding:10px;border-radius:6px;text-align:center;text-decoration:none">✓ YES — 1 day</a>
     <a href="${yes2}" style="background:#0369a1;color:#fff;padding:10px;border-radius:6px;text-align:center;text-decoration:none">✓ YES — 2 days</a>
     <a href="${yes3}" style="background:#0369a1;color:#fff;padding:10px;border-radius:6px;text-align:center;text-decoration:none">✓ YES — 3 days</a>
-    <a href="${undecided}" style="background:#7c3aed;color:#fff;padding:12px;border-radius:6px;text-align:center;text-decoration:none;font-weight:600">? Guest undecided — follow up 5 days before arrival</a>
+    <a href="${undecided}" style="background:#7c3aed;color:#fff;padding:12px;border-radius:6px;text-align:center;text-decoration:none;font-weight:600">? Guest undecided — snooze (I'll follow up myself)</a>
     <a href="${no}" style="background:#dc2626;color:#fff;padding:12px;border-radius:6px;text-align:center;text-decoration:none;font-weight:600">✗ NO — decline</a>
   </div>
   <p style="color:#94a3b8;font-size:12px;margin:0">Links expire in 14 days. Reservation ID ${reservation.id}.</p>

@@ -147,7 +147,7 @@ app.get('/confirm', async (req, res) => {
       res.send(confirmPage('✓ Confirmed', `Pool heat scheduled (${days}) for reservation ${payload.r}. You should receive a scheduling alert shortly.`, '#16a34a'));
     } else if (payload.a === 'undecided') {
       markUndecided(payload.r);
-      res.send(confirmPage('? Marked undecided', `Reservation ${payload.r} kept in pending queue. We'll send the guest a Hostaway message asking them to decide once we're 5 days from arrival.`, '#7c3aed'));
+      res.send(confirmPage('? Marked undecided', `Reservation ${payload.r} kept in the pending queue and snoozed — no more confirm emails for this guest unless they reply. The system will not message the guest; follow up yourself when you're ready.`, '#7c3aed'));
     } else {
       markDeclined(payload.r);
       res.send(confirmPage('✗ Declined', `Reservation ${payload.r} marked as declined. No pool heat will be scheduled.`, '#dc2626'));
