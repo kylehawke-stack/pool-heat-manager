@@ -74,6 +74,39 @@ const HOST_PAYMENT_SIGNALS = [
   'card on file has been charged',
 ];
 
+/**
+ * A guest raising pool heat themselves, with no host offer in the thread.
+ *
+ * The classifier is offer-gated: it locates the "gallons of propane" template
+ * and only then reads replies after it. That structurally cannot see a guest
+ * who asks first — and it cannot see an exchange where the host answered
+ * off-template ("What did you decide regarding pool heat? $375 for 3 nights").
+ * Both happened live: Vasiliki McDonough (Elmwood 9/18) wrote "We would love
+ * the pool heated" on 2026-09-02, and the reply that followed never contained
+ * the template phrase, so the whole conversation classified `not_discussed`.
+ *
+ * Matching one of these NEVER schedules heat. It can only return `pending`,
+ * which routes to Brady's confirm email. Auto-scheduling still requires the
+ * real offer template plus a positive reply — a loose match must not be able
+ * to fire a heater (cf. the Ana Ness false-positive, 2026-05-29).
+ *
+ * Deliberately requires heat/warm NEAR pool. "a pool day & hot tub" (Rosemary
+ * Jones, Boho 9/17) is trip chatter, not a request, and must not match.
+ */
+const GUEST_HEAT_REQUEST: RegExp[] = [
+  /pool[^.!?]{0,25}heat/i,
+  /heat[^.!?]{0,25}pool/i,
+  /heated pool/i,
+  /pool[^.!?]{0,15}warm/i,
+  /warm[^.!?]{0,15}pool/i,
+  // Spanish — Brady/Kyle host Spanish-speaking guests (Alba Portillo, Boho).
+  /climatizador/i,
+  /climatiz[a-zé]*[^.!?]{0,15}piscina/i,
+  /piscina[^.!?]{0,15}climatiz/i,
+  /calentar[^.!?]{0,15}piscina/i,
+  /piscina[^.!?]{0,15}(?:caliente|temperada|climatizada)/i,
+];
+
 export interface PoolHeatResult {
   status: 'agreed' | 'declined' | 'pending' | 'not_discussed';
   /** Number of days of heat requested. null = full stay, number = partial. */
@@ -180,7 +213,25 @@ export function scanMessagesForPoolHeat(messages: NormalisedMessage[]): PoolHeat
     }
   }
 
-  if (!hostOfferedHeat) return { status: 'not_discussed', heatDays: null };
+  if (!hostOfferedHeat) {
+    // No offer template in the thread. Before concluding nobody discussed heat,
+    // check whether the GUEST raised it — see GUEST_HEAT_REQUEST. This returns
+    // `pending` (→ Brady's confirm email) and never `agreed`: without the offer
+    // we have no quoted price and no reply to parse days from, so a human
+    // decides. A negative reply still wins, so a guest who asks and then backs
+    // out ("we decided not to heat after all") is not sent for confirmation.
+    const guestRaisedIt = sorted.some(m => {
+      const isGuest = m.isIncoming === 1 || m.senderType === 'guest';
+      return isGuest && GUEST_HEAT_REQUEST.some(rx => rx.test(m.body || ''));
+    });
+    if (!guestRaisedIt) return { status: 'not_discussed', heatDays: null };
+
+    const guestDeclined = sorted.some(m => {
+      const isGuest = m.isIncoming === 1 || m.senderType === 'guest';
+      return isGuest && NEGATIVE_SIGNALS.some(kw => (m.body || '').toLowerCase().includes(kw));
+    });
+    return { status: guestDeclined ? 'declined' : 'pending', heatDays: null };
+  }
 
   // PRIMARY SIGNAL: host confirmed payment after the offer. Kyle only sends
   // these AFTER a guest has already verbally agreed, so this is deterministic.

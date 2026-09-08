@@ -86,7 +86,12 @@ app.post('/webhook/ownerrez', async (req, res) => {
       return;
     }
 
-    if (entityType === 'thread_message' && action === 'entity_create') {
+    // entity_update matters as much as entity_create. Observed live: a message
+    // composed in the OwnerRez inbox arrives as entity_create with
+    // is_draft:true, then one or more entity_updates, and only the LAST of
+    // those carries is_draft:false — the actual send. Handling creates alone
+    // meant an edited or draft-then-sent message never triggered a rescan.
+    if (entityType === 'thread_message' && (action === 'entity_create' || action === 'entity_update')) {
       // Only guest messages matter. from_role covers the guest and the people
       // booking on their behalf; owner/co_host/bot messages are ours.
       const role = String(entity.from_role || '');
@@ -94,7 +99,9 @@ app.post('/webhook/ownerrez', async (req, res) => {
       const threadId = entity.thread_id ?? entity.thread?.id;
       const bookingId = entity.thread?.booking_id;
 
-      if (!isGuest) {
+      if (entity.is_draft) {
+        console.log(`[Webhook] Draft message on thread ${threadId ?? '?'} — skipping until sent`);
+      } else if (!isGuest) {
         console.log(`[Webhook] Message from '${role || 'unknown'}' — skipping`);
       } else if (!threadId) {
         console.warn(`[Webhook] thread_message with no thread id — cannot scan: ${JSON.stringify(body).slice(0, 300)}`);
