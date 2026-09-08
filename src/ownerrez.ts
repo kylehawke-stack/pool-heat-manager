@@ -344,11 +344,19 @@ export async function getConversationMessages(
     all.push(...await getThreadMessages(tid));
   }
 
-  // Multiple threads (rare — e.g. a channel thread plus a direct email thread)
-  // interleave by timestamp so the offer/reply ordering stays correct.
-  if (ids.length > 1) {
-    all.sort((a, b) => new Date(a.insertedOn).getTime() - new Date(b.insertedOn).getTime());
-  }
+  // ALWAYS sort, single thread included. The Hostaway-era rule was "trust the
+  // API's return order" — that is WRONG for OwnerRez, which returns a thread
+  // neither ascending nor descending (observed on thread 11801298: newest
+  // first for the recent block, then oldest-first for the rest). Everything
+  // downstream depends on chronology: detection reads replies *after* the
+  // offer, and the confirm email shows Brady `slice(-6)` as "the latest
+  // messages" — unsorted, that handed him the oldest six and a transcript with
+  // no pool-heat discussion in it at all.
+  //
+  // OwnerRez timestamps are genuine and distinct, so this is safe. (The old
+  // don't-sort rule existed because bulk-imported Hostaway conversations all
+  // shared one timestamp; that PMS is gone.)
+  all.sort((a, b) => new Date(a.insertedOn).getTime() - new Date(b.insertedOn).getTime());
   return all;
 }
 
