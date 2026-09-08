@@ -8,7 +8,7 @@ Built for a real 3-pool STR operation in Virginia, running in production since M
 
 ## How it works
 
-1. **Monitor** — polls the Hostaway API every 4 hours (plus a real-time webhook) for guest conversations.
+1. **Monitor** — polls the OwnerRez API every 4 hours (plus a real-time webhook) for guest conversations.
 2. **Detect** — scans messages for the host's pool-heat offer and the guest's reply. Clear agreements are parsed for the number of heat days ("3 days", "Wed to Fri", …). Ambiguous replies trigger a one-click classification email to the host — the agent never guesses.
 3. **Model** — pulls the Open-Meteo forecast and forward-simulates pool temperature: idle cooling until the heater starts, then heating with conservative net-rate assumptions. Picks the latest start time that still hits the target temp by check-in.
 4. **Actuate** — connects to the Pentair ScreenLogic gateway, updates the heat schedule, and sets the pool body. Turns the heater off at 8 PM on the last paid heat day.
@@ -22,7 +22,10 @@ Target temperature is seasonal (80–84°F depending on month), matching a per-d
 |------|------|
 | `src/index.ts` | Express server — webhook listener, health, manual scan, schedule inspection |
 | `src/scheduler.ts` | Cron scheduler, RECALCULATE/SANITY_READ events, heater ON/OFF execution, disk persistence |
-| `src/hostaway.ts` | Hostaway API client, message scanning, agreement detection |
+| `src/ownerrez.ts` | OwnerRez API client (bookings, messages, webhook subscriptions) |
+| `src/detect.ts` | Offer/agreement detection — keyword signals and heat-day parsing |
+| `src/ownerrez-auth.ts` | One-time OAuth device-grant authorisation (`npm run orz:auth`) |
+| `src/ownerrez-webhooks.ts` | List/create webhook subscriptions (`npm run orz:webhooks`) |
 | `src/screenlogic.ts` | Pentair ScreenLogic control (read temps, set heat, update schedules) |
 | `src/weather.ts` | Open-Meteo forecasts + thermodynamic heat-up simulation |
 | `src/pricing.ts` | Season-based target temps and pricing |
@@ -42,7 +45,8 @@ cd pool-heat-manager
 npm install
 
 # Configure credentials
-cp .env.example .env          # API keys: Hostaway, Pentair, Resend, Twilio
+cp .env.example .env          # API keys: OwnerRez, Pentair, Resend, Twilio
+npm run orz:auth              # one-time OwnerRez OAuth (required to read guest messages)
 
 # Configure your properties (listing IDs, gateway names, coordinates)
 cp properties.example.json properties.json

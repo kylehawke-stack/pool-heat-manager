@@ -1,7 +1,7 @@
 [
   {
     "name": "Lake House",
-    "hostawayListingId": 111111,
+    "ownerrezPropertyId": 123456,
     "poolSystem": "screenlogic",
     "screenlogicGateway": "Pentair: XX-XX-XX",
     "latitude": 38.0,
@@ -12,7 +12,7 @@
   },
   {
     "name": "Mountain Cabin",
-    "hostawayListingId": 222222,
+    "ownerrezPropertyId": 123456,
     "poolSystem": "intelliconnect",
     "latitude": 37.0,
     "longitude": -79.0,

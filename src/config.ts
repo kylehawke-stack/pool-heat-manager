@@ -5,7 +5,10 @@ dotenv.config();
 
 export interface PropertyConfig {
   name: string;
-  hostawayListingId: number;
+  /** OwnerRez property id — the listing key since the 2026-09 migration. */
+  ownerrezPropertyId: number;
+  /** Retired Hostaway listing id. Kept for provenance only; nothing reads it. */
+  hostawayListingId?: number;
   poolSystem: 'screenlogic' | 'intelliconnect';
   // ScreenLogic gateway name (found via Pentair app or discovery)
   screenlogicGateway?: string;
@@ -37,10 +40,13 @@ export const properties: PropertyConfig[] = rawProperties.map((p) => ({
 }));
 
 export const config = {
-  hostaway: {
-    clientId: process.env.HOSTAWAY_CLIENT_ID || '',
-    clientSecret: process.env.HOSTAWAY_CLIENT_SECRET || '',
-    baseUrl: 'https://api.hostaway.com/v1',
+  ownerrez: {
+    // Personal Access Token — bookings, properties, guests. NOT messaging.
+    patEmail: process.env.OWNERREZ_PAT_EMAIL || '',
+    patToken: process.env.OWNERREZ_PAT_TOKEN || '',
+    // OAuth app — required for the messaging endpoints and for webhooks.
+    clientId: process.env.OWNERREZ_CLIENT_ID || '',
+    clientSecret: process.env.OWNERREZ_CLIENT_SECRET || '',
   },
   pentair: {
     email: process.env.PENTAIR_EMAIL || '',

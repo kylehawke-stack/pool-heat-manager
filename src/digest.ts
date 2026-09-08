@@ -1,6 +1,7 @@
 import { Resend } from 'resend';
 import { config, properties } from './config';
-import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat } from './hostaway';
+import { getAllUpcomingReservations, getConversationMessages } from './ownerrez';
+import { scanMessagesForPoolHeat } from './detect';
 import { getScheduleState, pendingConfirms, declinedReservations } from './scheduler';
 
 const resend = config.resend.apiKey ? new Resend(config.resend.apiKey) : null;
@@ -26,7 +27,7 @@ export async function sendWeeklyDigest(): Promise<void> {
 }
 
 export async function buildDigestHtml(): Promise<string> {
-  const listingIds = properties.map(p => p.hostawayListingId);
+  const listingIds = properties.map(p => p.ownerrezPropertyId);
   const allReservations = await getAllUpcomingReservations(listingIds);
   const in14 = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
   const upcoming = allReservations.filter(r => r.arrivalDate <= in14);
@@ -40,15 +41,15 @@ export async function buildDigestHtml(): Promise<string> {
   }
 
   const propertyName: Record<number, string> = {};
-  for (const p of properties) propertyName[p.hostawayListingId] = p.name;
+  for (const p of properties) propertyName[p.ownerrezPropertyId] = p.name;
 
   const rows = await Promise.all(upcoming.map(async (r) => {
-    const messages = await getConversationMessages(r.id);
+    const messages = await getConversationMessages(r.id, r.threadIds);
     const scan = scanMessagesForPoolHeat(messages);
     const events = eventsByReservation.get(r.id) || [];
     const statusBadge = renderStatus(scan.status, pendingConfirms.has(r.id), declinedReservations.has(r.id), events.length > 0);
-    const timezoneOfProp = properties.find(p => p.hostawayListingId === r.listingMapId)?.timezone || 'America/New_York';
-    const isIntelliConnect = properties.find(p => p.hostawayListingId === r.listingMapId)?.poolSystem === 'intelliconnect';
+    const timezoneOfProp = properties.find(p => p.ownerrezPropertyId === r.listingMapId)?.timezone || 'America/New_York';
+    const isIntelliConnect = properties.find(p => p.ownerrezPropertyId === r.listingMapId)?.poolSystem === 'intelliconnect';
     const eventsHtml = events.filter(e => e.action !== 'RECALCULATE').map(e =>
       `<div style="font-size:13px;color:${e.executed?'#94a3b8':'#0f172a'}">${e.action}: ${new Date(e.scheduledTime).toLocaleString('en-US', { timeZone: timezoneOfProp, weekday:'short', month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })}${e.executed?' <span style="color:#94a3b8">(done)</span>':''}</div>`
     ).join('') || '<div style="color:#94a3b8;font-size:13px">—</div>';
@@ -70,7 +71,7 @@ export async function buildDigestHtml(): Promise<string> {
 
   const manualActionFlags: string[] = [];
   for (const r of upcoming) {
-    const p = properties.find(pp => pp.hostawayListingId === r.listingMapId);
+    const p = properties.find(pp => pp.ownerrezPropertyId === r.listingMapId);
     if (!p) continue;
     if (p.poolSystem === 'intelliconnect') {
       const events = eventsByReservation.get(r.id) || [];

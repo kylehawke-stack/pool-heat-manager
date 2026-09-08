@@ -2,7 +2,8 @@ import cron from 'node-cron';
 import fs from 'fs';
 import path from 'path';
 import { properties, PropertyConfig } from './config';
-import { getAllUpcomingReservations, getConversationMessages, scanMessagesForPoolHeat, getReservation, getConversation, Reservation, PoolHeatResult } from './hostaway';
+import { getAllUpcomingReservations, getConversationMessages, getReservation, getBookingIdForThread, MessagingUnavailableError, hasOAuth, Reservation } from './ownerrez';
+import { scanMessagesForPoolHeat, PoolHeatResult } from './detect';
 import { getPoolStatus, setPoolHeat, turnOffPoolHeat, updatePoolScheduleHeatOn, updatePoolScheduleHeatOff } from './screenlogic';
 import { calculateHeaterStartTime } from './weather';
 import { alertHeaterAction, alertManualReminder, sendAlert } from './alerts';
@@ -443,7 +444,7 @@ export const pendingConfirms = new Set<number>();
 export const declinedReservations = new Set<number>();
 
 function getPropertyForListing(listingId: number): PropertyConfig | undefined {
-  return properties.find(p => p.hostawayListingId === listingId);
+  return properties.find(p => p.ownerrezPropertyId === listingId);
 }
 
 /**
@@ -481,7 +482,11 @@ function zonedDate(isoDate: string, hour: number, minute: number, timezone: stri
  * Returns the scan result with status and heat days.
  */
 async function checkReservationHeat(reservation: Reservation): Promise<PoolHeatResult> {
-  const messages = await getConversationMessages(reservation.id);
+  // Deliberately NOT wrapped in a try/catch. A messaging failure must propagate:
+  // swallowing it returns an empty conversation, which classifies as
+  // 'not_discussed' and is indistinguishable from "the guest never asked for
+  // heat" — a silent skip of a paid booking. Callers surface it as an alert.
+  const messages = await getConversationMessages(reservation.id, reservation.threadIds);
   if (messages.length > 0) {
     return scanMessagesForPoolHeat(messages);
   }
@@ -1095,12 +1100,34 @@ export async function scanReservations() {
   console.log(`[${new Date().toISOString()}] Scanning reservations...`);
 
   try {
-    const listingIds = properties.map(p => p.hostawayListingId);
+    const listingIds = properties.map(p => p.ownerrezPropertyId);
     const reservations = await getAllUpcomingReservations(listingIds);
+
+    // Detection reads guest conversations, which OwnerRez gates behind an OAuth
+    // app. Without one the loop below would classify every booking as
+    // 'not_discussed' and report a clean scan while seeing nothing — so stop
+    // here and say so, loudly, rather than shipping a silent partial.
+    if (!hasOAuth()) {
+      const msg =
+        `${reservations.length} upcoming booking(s) found, but guest messages cannot be read: ` +
+        'no OwnerRez OAuth token. Pool-heat detection is BLIND until one is authorised ' +
+        '(create an OAuth app, Users → "Grant Access To Me", then run `npm run orz:auth`).';
+      console.error(`[Scan] ABORTED — ${msg}`);
+      await sendAlert('error', 'Pool heat detection is blind — OwnerRez OAuth missing', msg);
+      return;
+    }
 
     for (const res of reservations) {
       const property = getPropertyForListing(res.listingMapId);
       if (!property) continue;
+
+      // A booking with no message thread (direct bookings, and the ones migrated
+      // by hand) can't be scanned. Log it so the gap is visible instead of
+      // silently reading as "no heat requested".
+      if (res.threadIds.length === 0) {
+        console.log(`[Scan] ${res.guestName} (${property.name}, ${res.arrivalDate}) has no message thread — cannot scan, check manually`);
+        continue;
+      }
 
       const heatResult = await checkReservationHeat(res);
       if (heatResult.status === 'agreed' && declinedReservations.has(res.id)) {
@@ -1132,16 +1159,29 @@ export async function scanReservations() {
 }
 
 /**
- * Handle a webhook from Hostaway for new/updated reservations.
+ * Handle a webhook from OwnerRez for new/updated bookings.
  */
 export async function handleReservationWebhook(reservation: Reservation) {
   const property = getPropertyForListing(reservation.listingMapId);
   if (!property) return;
 
+  // Every by-id path needs its own status check. The 2026-08-10 incident (a
+  // message sent to a guest who had cancelled in July) happened because the
+  // status filter lived only in the list fetch; this handler had no guard at all.
+  if (reservation.status !== 'active' || reservation.isBlock) {
+    console.log(`[Webhook] Skipping ${reservation.guestName} — status '${reservation.status}'${reservation.isBlock ? ' (block)' : ''}, not an active booking`);
+    return;
+  }
+
   // Skip checked-out reservations (webhooks fire on checkout status changes too)
   const today = new Date().toISOString().split('T')[0];
   if (reservation.departureDate <= today) {
     console.log(`[Webhook] Skipping ${reservation.guestName} — already departed ${reservation.departureDate}`);
+    return;
+  }
+
+  if (reservation.threadIds.length === 0) {
+    console.log(`[Webhook] ${reservation.guestName} (${property.name}) has no message thread yet — nothing to scan`);
     return;
   }
 
@@ -1154,16 +1194,18 @@ export async function handleReservationWebhook(reservation: Reservation) {
 }
 
 /**
- * Handle a message webhook — a new guest message arrived in a conversation.
- * Look up the reservation, scan for pool heat, and schedule if agreed.
+ * Handle a message webhook — a new guest message arrived on a thread.
+ *
+ * OwnerRez `thread_message` webhooks carry the thread, not always the booking,
+ * so the booking is resolved from the thread. `bookingId` is passed through when
+ * the payload already contains it, saving a round trip.
  */
-export async function handleMessageWebhook(conversationId: number) {
+export async function handleMessageWebhook(threadId: number, bookingId?: number) {
+  const conversationId = threadId; // kept for the log lines below
   try {
-    // Get the conversation to find the reservationId
-    const conversation = await getConversation(conversationId);
-    const reservationId = conversation?.reservationId;
+    const reservationId = bookingId ?? await getBookingIdForThread(threadId);
     if (!reservationId) {
-      console.log(`[Message Webhook] Conversation ${conversationId} has no reservation — skipping`);
+      console.log(`[Message Webhook] Thread ${threadId} has no booking — skipping`);
       return;
     }
 
@@ -1175,9 +1217,10 @@ export async function handleMessageWebhook(conversationId: number) {
       return;
     }
 
-    // Skip cancelled/inquiry reservations — a guest replying on a dead thread
+    // Skip cancelled/pending bookings — a guest replying on a dead thread
     // shouldn't produce a confirm email or scheduling (Stephanie Gillman, 8/10).
-    if (reservation.status !== 'modified') {
+    // OwnerRez vocabulary: 'active' is the confirmed booking (was Hostaway 'modified').
+    if (reservation.status !== 'active' || reservation.isBlock) {
       console.log(`[Message Webhook] Reservation ${reservationId} status '${reservation.status}' — not an active booking, skipping`);
       pendingConfirms.delete(reservationId);
       persistConfirmState();

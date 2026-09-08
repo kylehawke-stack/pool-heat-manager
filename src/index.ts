@@ -2,6 +2,7 @@ import express from 'express';
 import crypto from 'crypto';
 import { config } from './config';
 import { handleReservationWebhook, handleMessageWebhook, startScheduler, getScheduleState, scanReservations, forceAgreement, markDeclined, markUndecided, delayHeaterOn } from './scheduler';
+import { getReservation, hasOAuth } from './ownerrez';
 import { sendAlert } from './alerts';
 import { verifyConfirm } from './confirm';
 import { verifyOverride } from './override';
@@ -15,8 +16,13 @@ app.use(express.urlencoded({ extended: false })); // Twilio sends form-encoded
 // Health check
 app.get('/health', (_req, res) => {
   const schedule = getScheduleState();
+  const messaging = hasOAuth() ? 'ok' : 'blind — no OwnerRez OAuth token';
   res.json({
-    status: 'ok',
+    // Degraded, not ok: without message access the system cannot detect a single
+    // pool-heat agreement, so /health must not report a clean bill of health.
+    status: hasOAuth() ? 'ok' : 'degraded',
+    pms: 'ownerrez',
+    messaging,
     uptime: process.uptime(),
     schedule: {
       pending: schedule.pending.length,
@@ -26,10 +32,10 @@ app.get('/health', (_req, res) => {
 });
 
 /**
- * Verify Basic Auth credentials sent by Hostaway with webhook requests.
- * Hostaway includes an Authorization: Basic header only when the webhook
- * registration has login/password set. Returns true if no credentials are
- * configured locally (local dev / OSS default).
+ * Verify Basic Auth credentials sent with webhook requests.
+ * OwnerRez sends `Authorization: Basic` using the User/Password configured
+ * alongside the Webhook URL in the OAuth app settings. Returns true if no
+ * credentials are configured locally (local dev / OSS default).
  */
 function verifyWebhookAuth(req: express.Request): boolean {
   const { webhookLogin, webhookPassword } = config.server;
@@ -47,8 +53,10 @@ function verifyWebhookAuth(req: express.Request): boolean {
   return expected.length === received.length && crypto.timingSafeEqual(expected, received);
 }
 
-// Hostaway unified webhook — receives ALL event types on one URL
-app.post('/webhook/hostaway', async (req, res) => {
+// OwnerRez webhook — one URL receives every subscribed entity type.
+// Payload shape: { id, user_id, action, entity_type, entity_id, categories, entity }
+// (https://www.ownerrez.com/support/articles/api-webhooks)
+app.post('/webhook/ownerrez', async (req, res) => {
   try {
     if (!verifyWebhookAuth(req)) {
       console.warn('[Webhook] Auth failed — rejecting');
@@ -56,58 +64,59 @@ app.post('/webhook/hostaway', async (req, res) => {
       return;
     }
 
-    const body = req.body;
+    const body = req.body || {};
     console.log(`[Webhook] Received:`, JSON.stringify(body).slice(0, 500));
 
-    // Hostaway unified webhooks may use different payload shapes.
-    // Try to detect the event type from the payload.
-    const event = body.event || body.type || '';
+    const action: string = body.action || '';
+    const entityType: string = body.entity_type || '';
+    const entity = body.entity || {};
 
-    // --- Reservation events ---
-    if (event === 'reservation.created' || event === 'reservation.updated') {
-      const reservation = body.data || body.reservation || body;
-      console.log(`[Webhook] ${event} — reservation ${reservation?.id}`);
-      await handleReservationWebhook(reservation);
+    // Connection-level events carry no entity.
+    if (action === 'application_authorization_revoked') {
+      console.error('[Webhook] OwnerRez authorization REVOKED — messaging and webhooks are now dead until re-authorised');
+      await sendAlert('error', 'OwnerRez access revoked',
+        'The OAuth app authorization was revoked. Pool heat detection is blind until `npm run orz:auth` is re-run.');
+      res.status(200).json({ received: true });
+      return;
     }
 
-    // --- Message events ---
-    else if (
-      event === 'conversationMessage.created' ||
-      event === 'conversation_message.created' ||
-      event === 'message.created' ||
-      event === 'message.received' ||
-      event === 'new_message'
-    ) {
-      const data = body.data || body.message || body;
-      const isGuest = data?.isIncoming === 1 || data?.senderType === 'guest';
-      if (isGuest) {
-        const conversationId = data?.conversationId || data?.conversation_id;
-        if (conversationId) {
-          console.log(`[Webhook] Guest message in conversation ${conversationId}`);
-          await handleMessageWebhook(conversationId);
-        }
+    if (action === 'webhook_test') {
+      console.log('[Webhook] Test ping from OwnerRez');
+      res.status(200).json({ received: true });
+      return;
+    }
+
+    if (entityType === 'thread_message' && action === 'entity_create') {
+      // Only guest messages matter. from_role covers the guest and the people
+      // booking on their behalf; owner/co_host/bot messages are ours.
+      const role = String(entity.from_role || '');
+      const isGuest = role === 'guest' || role === 'cotraveler' || role === 'third_party_booker';
+      const threadId = entity.thread_id ?? entity.thread?.id;
+      const bookingId = entity.thread?.booking_id;
+
+      if (!isGuest) {
+        console.log(`[Webhook] Message from '${role || 'unknown'}' — skipping`);
+      } else if (!threadId) {
+        console.warn(`[Webhook] thread_message with no thread id — cannot scan: ${JSON.stringify(body).slice(0, 300)}`);
       } else {
-        console.log(`[Webhook] Host/system message — skipping`);
+        console.log(`[Webhook] Guest message on thread ${threadId}${bookingId ? ` (booking ${bookingId})` : ''}`);
+        await handleMessageWebhook(Number(threadId), bookingId ? Number(bookingId) : undefined);
       }
     }
 
-    // --- Unknown event — log it so we can see what Hostaway actually sends ---
-    else {
-      console.log(`[Webhook] Unknown event type: "${event}" — logging full payload for debugging`);
-      // If there's a conversationId anywhere in the payload, it might be a message
-      const conversationId = body.data?.conversationId || body.conversationId || body.conversation_id;
-      const reservationId = body.data?.id || body.data?.reservationId || body.reservationId;
-
-      if (conversationId) {
-        console.log(`[Webhook] Found conversationId ${conversationId} — treating as message event`);
-        const isGuest = body.data?.isIncoming === 1 || body.data?.senderType === 'guest' || body.isIncoming === 1;
-        if (isGuest) {
-          await handleMessageWebhook(conversationId);
-        }
-      } else if (reservationId) {
-        console.log(`[Webhook] Found reservationId ${reservationId} — treating as reservation event`);
-        await handleReservationWebhook(body.data || body);
+    else if (entityType === 'booking' && (action === 'entity_create' || action === 'entity_update')) {
+      const bookingId = body.entity_id ?? entity.id;
+      console.log(`[Webhook] booking ${action} — ${bookingId} (categories: ${(body.categories || []).join(', ') || 'none'})`);
+      // Refetch rather than trusting the embedded entity: the webhook body has
+      // no guest name and the scheduler needs one for its alerts.
+      if (bookingId) {
+        const reservation = await getReservation(Number(bookingId));
+        await handleReservationWebhook(reservation);
       }
+    }
+
+    else {
+      console.log(`[Webhook] Ignoring ${action || 'unknown action'} on ${entityType || 'unknown entity'}`);
     }
 
     res.status(200).json({ received: true });
@@ -227,5 +236,16 @@ app.listen(config.server.port, async () => {
   console.log(`Pool Heat Manager running on port ${config.server.port}`);
   startScheduler();
 
-  await sendAlert('info', 'Pool Heat Manager started', `Server is running on port ${config.server.port}`);
+  if (!hasOAuth()) {
+    console.error('[Startup] No OwnerRez OAuth token — guest messages cannot be read and pool-heat detection is BLIND. Run `npm run orz:auth`.');
+  }
+
+  await sendAlert(
+    hasOAuth() ? 'info' : 'warning',
+    hasOAuth() ? 'Pool Heat Manager started' : '⚠️ Pool Heat Manager started — detection is BLIND',
+    hasOAuth()
+      ? `Server is running on port ${config.server.port} (PMS: OwnerRez)`
+      : `Server is running on port ${config.server.port}, but no OwnerRez OAuth token is present. ` +
+        'Guest messages cannot be read, so no pool-heat agreement will be detected. Run `npm run orz:auth`.'
+  );
 });

@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { Resend } from 'resend';
 import { config } from './config';
 import { PropertyConfig } from './config';
-import { Reservation, getConversationMessages } from './hostaway';
+import { Reservation, getConversationMessages } from './ownerrez';
 
 const resend = config.resend.apiKey ? new Resend(config.resend.apiKey) : null;
 
@@ -59,7 +59,7 @@ export async function sendConfirmRequest(reservation: Reservation, property: Pro
     return;
   }
 
-  const messages = await getConversationMessages(reservation.id);
+  const messages = await getConversationMessages(reservation.id, reservation.threadIds);
   const last6 = messages.slice(-6);
   const transcript = last6.map(m => {
     const who = m.isIncoming === 1 ? 'GUEST' : 'HOST';

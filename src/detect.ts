@@ -1,168 +1,24 @@
-import { config } from './config';
-
-let cachedToken: { token: string; expiresAt: number } | null = null;
-
-async function getAccessToken(): Promise<string> {
-  if (cachedToken && Date.now() < cachedToken.expiresAt) {
-    return cachedToken.token;
-  }
-
-  const res = await fetch(`${config.hostaway.baseUrl}/accessTokens`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: config.hostaway.clientId,
-      client_secret: config.hostaway.clientSecret,
-      scope: 'general',
-    }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Hostaway auth failed: ${res.status} ${await res.text()}`);
-  }
-
-  const data = await res.json() as { access_token: string; expires_in: number };
-  cachedToken = {
-    token: data.access_token,
-    expiresAt: Date.now() + (data.expires_in - 3600) * 1000,
-  };
-  return cachedToken.token;
-}
-
-async function hostawayGet(path: string, params?: Record<string, string>): Promise<any> {
-  const token = await getAccessToken();
-  const url = new URL(`${config.hostaway.baseUrl}${path}`);
-  if (params) {
-    Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-  }
-
-  const res = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Hostaway GET ${path} failed: ${res.status} ${await res.text()}`);
-  }
-
-  const data = await res.json() as { result: any };
-  return data.result;
-}
-
-export interface Reservation {
-  id: number;
-  listingMapId: number;
-  channelId: number;
-  guestName: string;
-  guestEmail: string;
-  arrivalDate: string; // YYYY-MM-DD
-  departureDate: string;
-  status: string;
-}
-
 /**
- * Get all upcoming reservations across all listings.
- * Filters client-side by listingMapId since the Hostaway API filter is unreliable.
+ * PMS-agnostic pool-heat agreement detection.
+ *
+ * Moved out of hostaway.ts unchanged (2026-09-08) so the same signal lists and
+ * parsing serve both the retired Hostaway client and the OwnerRez one. The
+ * message shape this module consumes is a small normalised record — each PMS
+ * client is responsible for mapping its own payload onto it.
  */
-export async function getAllUpcomingReservations(listingIds: number[]): Promise<Reservation[]> {
-  const today = new Date().toISOString().split('T')[0];
-  const result = await hostawayGet('/reservations', {
-    arrivalStartDate: today,
-    sortOrder: 'arrivalDate',
-    limit: '200',
-  });
 
-  // Client-side filter: only confirmed reservations for our pool properties
-  // "modified" = confirmed booking. Exclude inquiry, cancelled, ownerStay, etc.
-  // Also exclude reservations that have already departed (departure <= today)
-  return (result || []).filter((r: Reservation) =>
-    listingIds.includes(r.listingMapId) &&
-    r.status === 'modified' &&
-    r.departureDate > today
-  );
-}
-
-/**
- * Get a single reservation by ID
- */
-export async function getReservation(id: number): Promise<Reservation> {
-  return hostawayGet(`/reservations/${id}`);
-}
-
-/**
- * Get conversation messages for a reservation to scan for pool heat discussion.
- */
-/**
- * Get a conversation by its ID (used by message webhooks).
- * Returns the conversation object which includes reservationId.
- */
-export async function getConversation(conversationId: number): Promise<any> {
-  return hostawayGet(`/conversations/${conversationId}`);
-}
-
-/**
- * Register a webhook with Hostaway.
- */
-export async function registerWebhook(url: string, event: string): Promise<any> {
-  const token = await getAccessToken();
-  const res = await fetch(`${config.hostaway.baseUrl}/webhooks`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ url, event }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Hostaway webhook registration failed: ${res.status} ${await res.text()}`);
-  }
-
-  return (await res.json() as any).result;
-}
-
-/**
- * List all registered webhooks.
- */
-export async function listWebhooks(): Promise<any[]> {
-  return (await hostawayGet('/webhooks')) || [];
-}
-
-/**
- * Delete a webhook by ID.
- */
-export async function deleteWebhook(webhookId: number): Promise<void> {
-  const token = await getAccessToken();
-  const res = await fetch(`${config.hostaway.baseUrl}/webhooks/${webhookId}`, {
-    method: 'DELETE',
-    headers: { 'Authorization': `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    throw new Error(`Hostaway webhook delete failed: ${res.status} ${await res.text()}`);
-  }
-}
-
-// NOTE: this module is deliberately read-only against guest conversations.
-// `sendConversationMessage` was removed 2026-08-10 — the system never writes
-// to a guest thread. All outbound communication goes to Brady (email/SMS);
-// talking to guests is his call. Don't reintroduce a send path.
-
-export async function getConversationMessages(reservationId: number): Promise<any[]> {
-  try {
-    const conversations = await hostawayGet('/conversations', {
-      reservationId: String(reservationId),
-    });
-    if (!conversations || conversations.length === 0) return [];
-
-    const conversationId = conversations[0].id;
-    const messages = await hostawayGet(`/conversations/${conversationId}/messages`);
-    return messages || [];
-  } catch {
-    return [];
-  }
+/** Normalised message record. Both PMS clients map onto this shape. */
+export interface NormalisedMessage {
+  body: string;
+  /** 1 = from the guest, 0 = from the host/system. */
+  isIncoming: 0 | 1;
+  senderType: 'guest' | 'host';
+  /** ISO timestamp. */
+  insertedOn: string;
 }
 
 // "gallons of propane" is the primary signal — uniquely identifies Brady's pool heat offer.
+// It survives verbatim in the OwnerRez snippets /poolheatabb and /poolheatvrbo.
 const OFFER_KEYWORDS = [
   'gallons of propane',
   '[pool heat offer]',
@@ -201,6 +57,23 @@ const NEGATIVE_SIGNALS = [
   "won't be heating", 'rather not heat', 'no longer want', 'changed our mind',
 ];
 
+/**
+ * Deterministic host-side "the guest already said yes" signals, checked before
+ * the fuzzy guest-reply parse. Brady only sends these AFTER a verbal agreement.
+ *
+ * Airbnb: he raises a resolution-centre payment request.
+ * Vrbo / direct: the OwnerRez snippet promises "I can charge your credit card
+ * on file", so the confirmation wording differs — hence the extra phrases.
+ */
+const HOST_PAYMENT_SIGNALS = [
+  'airbnb.com/resolutions',
+  'sent the payment request',
+  'charged your card',
+  'charged the card on file',
+  'charged your credit card',
+  'card on file has been charged',
+];
+
 export interface PoolHeatResult {
   status: 'agreed' | 'declined' | 'pending' | 'not_discussed';
   /** Number of days of heat requested. null = full stay, number = partial. */
@@ -215,10 +88,10 @@ export interface PoolHeatResult {
  * Looks for patterns like "2 days", "3 nights", "just the first 2 days", "only 3 days".
  * Returns null for full stay ("the week", "whole stay", or no specific count mentioned).
  */
-function parseHeatDays(messages: any[], offerIndex: number): number | null {
+function parseHeatDays(messages: NormalisedMessage[], offerIndex: number): number | null {
   // Only look at guest messages after the offer
   const guestResponsesAfterOffer = messages.slice(offerIndex + 1).filter(
-    (m: any) => m.isIncoming === 1 || m.senderType === 'guest'
+    (m) => m.isIncoming === 1 || m.senderType === 'guest'
   );
 
   for (const msg of guestResponsesAfterOffer) {
@@ -279,16 +152,16 @@ function parseHeatDays(messages: any[], offerIndex: number): number | null {
  * 3. Classify as agreed/declined/pending
  * 4. If agreed, parse how many days of heat they want
  */
-export function scanMessagesForPoolHeat(messages: any[]): PoolHeatResult {
+export function scanMessagesForPoolHeat(messages: NormalisedMessage[]): PoolHeatResult {
   // Use API return order (chronological). Sorting by insertedOn is unreliable
   // because bulk-imported conversations can have identical timestamps.
   // Fall back to ID ascending only if timestamps differ meaningfully.
   const sorted = [...messages];
-  const timestamps = sorted.map(m => new Date(m.insertedOn || m.createdAt || 0).getTime());
+  const timestamps = sorted.map(m => new Date(m.insertedOn || 0).getTime());
   const allSameTimestamp = timestamps.every(t => Math.abs(t - timestamps[0]) < 5000);
   if (!allSameTimestamp) {
     sorted.sort((a, b) =>
-      new Date(a.insertedOn || a.createdAt).getTime() - new Date(b.insertedOn || b.createdAt).getTime()
+      new Date(a.insertedOn).getTime() - new Date(b.insertedOn).getTime()
     );
   }
   // If all timestamps are within 5 seconds, trust the API's return order
@@ -309,15 +182,14 @@ export function scanMessagesForPoolHeat(messages: any[]): PoolHeatResult {
 
   if (!hostOfferedHeat) return { status: 'not_discussed', heatDays: null };
 
-  // PRIMARY SIGNAL: host sent Airbnb payment-request link after the offer.
-  // Kyle only sends "airbnb.com/resolutions" / "sent the payment request"
-  // AFTER a guest has already verbally agreed, so this is deterministic.
+  // PRIMARY SIGNAL: host confirmed payment after the offer. Kyle only sends
+  // these AFTER a guest has already verbally agreed, so this is deterministic.
   const hostMessagesAfter = sorted.slice(lastOfferIndex + 1).filter(
     m => m.isIncoming === 0 || m.senderType === 'host'
   );
   for (const msg of hostMessagesAfter) {
     const body = (msg.body || '').toLowerCase();
-    if (body.includes('airbnb.com/resolutions') || body.includes('sent the payment request')) {
+    if (HOST_PAYMENT_SIGNALS.some(kw => body.includes(kw))) {
       const heatDays = parseHeatDays(sorted, lastOfferIndex);
       return { status: 'agreed', heatDays };
     }

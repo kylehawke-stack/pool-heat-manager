@@ -1,7 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import twilio from 'twilio';
 import { config, properties } from './config';
-import { getAllUpcomingReservations, getConversationMessages, getReservation, scanMessagesForPoolHeat } from './hostaway';
+import { getAllUpcomingReservations, getConversationMessages, getReservation } from './ownerrez';
+import { scanMessagesForPoolHeat } from './detect';
 import { getScheduleState, pendingConfirms, declinedReservations } from './scheduler';
 
 const anthropic = config.anthropic.apiKey ? new Anthropic({ apiKey: config.anthropic.apiKey }) : null;
@@ -52,10 +53,10 @@ async function runTool(name: string, input: any): Promise<string> {
     case 'list_upcoming_reservations': {
       const days = input.days_ahead || 30;
       const cutoff = new Date(Date.now() + days * 86400000).toISOString().split('T')[0];
-      const rs = await getAllUpcomingReservations(properties.map(p => p.hostawayListingId));
+      const rs = await getAllUpcomingReservations(properties.map(p => p.ownerrezPropertyId));
       const filtered = rs.filter(r => r.arrivalDate <= cutoff);
       const propName: Record<number, string> = {};
-      properties.forEach(p => { propName[p.hostawayListingId] = p.name; });
+      properties.forEach(p => { propName[p.ownerrezPropertyId] = p.name; });
       return JSON.stringify(filtered.map(r => ({
         id: r.id,
         property: propName[r.listingMapId],
@@ -70,7 +71,7 @@ async function runTool(name: string, input: any): Promise<string> {
       const scan = scanMessagesForPoolHeat(messages);
       const state = getScheduleState();
       const events = [...state.pending, ...state.executed].filter(e => e.reservationId === r.id);
-      const propName = properties.find(p => p.hostawayListingId === r.listingMapId)?.name || 'Unknown';
+      const propName = properties.find(p => p.ownerrezPropertyId === r.listingMapId)?.name || 'Unknown';
       const lastMsgs = messages.slice(-5).map(m => ({
         from: m.isIncoming === 1 ? 'guest' : 'host',
         date: (m.insertedOn || '').slice(0, 19),
@@ -103,10 +104,10 @@ async function runTool(name: string, input: any): Promise<string> {
       });
     }
     case 'search_guest_by_name': {
-      const rs = await getAllUpcomingReservations(properties.map(p => p.hostawayListingId));
+      const rs = await getAllUpcomingReservations(properties.map(p => p.ownerrezPropertyId));
       const needle = (input.name || '').toLowerCase();
       const propName: Record<number, string> = {};
-      properties.forEach(p => { propName[p.hostawayListingId] = p.name; });
+      properties.forEach(p => { propName[p.ownerrezPropertyId] = p.name; });
       const matches = rs.filter(r => r.guestName.toLowerCase().includes(needle));
       return JSON.stringify(matches.map(r => ({
         id: r.id,
