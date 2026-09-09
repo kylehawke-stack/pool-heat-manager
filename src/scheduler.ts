@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { properties, PropertyConfig } from './config';
 import { getAllUpcomingReservations, getConversationMessages, getReservation, getBookingIdForThread, MessagingUnavailableError, hasOAuth, Reservation } from './ownerrez';
-import { scanMessagesForPoolHeat, PoolHeatResult } from './detect';
+import { scanMessagesForPoolHeat, PoolHeatResult, NormalisedMessage } from './detect';
 import { getPoolStatus, setPoolHeat, turnOffPoolHeat, updatePoolScheduleHeatOn, updatePoolScheduleHeatOff } from './screenlogic';
 import { calculateHeaterStartTime } from './weather';
 import { alertHeaterAction, alertManualReminder, sendAlert } from './alerts';
@@ -81,6 +81,12 @@ function persistConfirmState(): void {
     const data = {
       pendingConfirms: Array.from(pendingConfirms),
       declinedReservations: Array.from(declinedReservations),
+      // When Brady was last emailed about each reservation. Drives the re-nudge
+      // (see requestConfirmation) — without it, a restart would forget that we
+      // already asked and either spam or, worse, go quiet on a guest's yes.
+      confirmAskedAt: Object.fromEntries(
+        Array.from(confirmAskedAt.entries()).map(([id, ms]) => [String(id), new Date(ms).toISOString()])
+      ),
     };
     fs.writeFileSync(CONFIRM_STATE_PATH, JSON.stringify(data, null, 2));
   } catch (err: any) {
@@ -96,11 +102,21 @@ function loadConfirmState(): { pending: number; declined: number } {
     const data = JSON.parse(fs.readFileSync(CONFIRM_STATE_PATH, 'utf8')) as {
       pendingConfirms?: number[];
       declinedReservations?: number[];
+      confirmAskedAt?: Record<string, string>;
     };
     pendingConfirms.clear();
     declinedReservations.clear();
+    confirmAskedAt.clear();
     (data.pendingConfirms ?? []).forEach(id => pendingConfirms.add(id));
     (data.declinedReservations ?? []).forEach(id => declinedReservations.add(id));
+    // State written before the re-nudge existed has no timestamps. Those
+    // reservations get one reminder on the next scan (any guest message beats
+    // an unknown ask time), which is the right answer for a backlog that has
+    // been sitting unanswered.
+    for (const [id, iso] of Object.entries(data.confirmAskedAt ?? {})) {
+      const ms = Date.parse(iso);
+      if (!Number.isNaN(ms)) confirmAskedAt.set(Number(id), ms);
+    }
     return {
       pending: pendingConfirms.size,
       declined: declinedReservations.size,
@@ -319,6 +335,7 @@ export async function forceAgreement(reservationId: number, heatDays: number | n
   await scheduleForReservation(reservation, property, { status: 'agreed', heatDays });
   pendingConfirms.delete(reservationId);
   declinedReservations.delete(reservationId);
+  confirmAskedAt.delete(reservationId);
   persistConfirmState();
   return true;
 }
@@ -327,6 +344,7 @@ export async function forceAgreement(reservationId: number, heatDays: number | n
 export function markDeclined(reservationId: number): void {
   pendingConfirms.delete(reservationId);
   declinedReservations.add(reservationId);
+  confirmAskedAt.delete(reservationId);
   persistConfirmState();
 }
 
@@ -335,10 +353,15 @@ export function markDeclined(reservationId: number): void {
  * Purely a snooze: stays in pendingConfirms so Brady doesn't get re-emailed
  * every scan. The system never contacts the guest — following up is Brady's
  * call (see the 2026-08-10 removal of guest messaging).
+ *
+ * The snooze silences repeat scans, NOT the guest: stamping `confirmAskedAt` to
+ * now means the next thing the guest says still re-opens the ask. That is the
+ * point of snoozing an undecided guest — you want to hear when they decide.
  */
 export function markUndecided(reservationId: number): void {
   pendingConfirms.add(reservationId);
   declinedReservations.delete(reservationId);
+  confirmAskedAt.set(reservationId, Date.now());
   persistConfirmState();
 }
 
@@ -442,6 +465,9 @@ export async function delayHeaterOn(
 export const pendingConfirms = new Set<number>();
 // Reservations Brady said NO to.
 export const declinedReservations = new Set<number>();
+// Epoch ms of the last confirm email per reservation. A guest message newer than
+// this is unanswered news, and re-opens the ask (see requestConfirmation).
+export const confirmAskedAt = new Map<number, number>();
 
 function getPropertyForListing(listingId: number): PropertyConfig | undefined {
   return properties.find(p => p.ownerrezPropertyId === listingId);
@@ -481,16 +507,120 @@ function zonedDate(isoDate: string, hour: number, minute: number, timezone: stri
  * Check if a reservation qualifies for pool heat by scanning messages.
  * Returns the scan result with status and heat days.
  */
-async function checkReservationHeat(reservation: Reservation): Promise<PoolHeatResult> {
+async function checkReservationHeat(
+  reservation: Reservation
+): Promise<{ result: PoolHeatResult; messages: NormalisedMessage[] }> {
   // Deliberately NOT wrapped in a try/catch. A messaging failure must propagate:
   // swallowing it returns an empty conversation, which classifies as
   // 'not_discussed' and is indistinguishable from "the guest never asked for
   // heat" — a silent skip of a paid booking. Callers surface it as an alert.
   const messages = await getConversationMessages(reservation.id, reservation.threadIds);
-  if (messages.length > 0) {
-    return scanMessagesForPoolHeat(messages);
+  const result: PoolHeatResult = messages.length > 0
+    ? scanMessagesForPoolHeat(messages)
+    : { status: 'not_discussed', heatDays: null };
+  // The thread comes back with the verdict so callers can reason about *when*
+  // the guest last spoke (the re-nudge) and render a transcript, without a
+  // second round trip to OwnerRez for the same messages.
+  return { result, messages };
+}
+
+/** Epoch ms of the newest GUEST message in a thread, or null if there are none. */
+function latestGuestMessageTime(messages: NormalisedMessage[]): number | null {
+  let latest: number | null = null;
+  for (const m of messages) {
+    const isGuest = m.isIncoming === 1 || m.senderType === 'guest';
+    if (!isGuest) continue;
+    const ms = parseUtcTimestamp(m.insertedOn);
+    if (ms !== null && (latest === null || ms > latest)) latest = ms;
   }
-  return { status: 'not_discussed', heatDays: null };
+  return latest;
+}
+
+/**
+ * OwnerRez `date_utc` is UTC but is not always suffixed with `Z`. A bare
+ * `2026-09-09T13:26:47` would otherwise parse as server-local — the same class
+ * of bug as the 2026-04-09 four-hour offset.
+ */
+function parseUtcTimestamp(raw: string): number | null {
+  if (!raw) return null;
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(raw);
+  const ms = Date.parse(hasZone ? raw : `${raw}Z`);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/** At most one confirm email per reservation per hour, however chatty the guest. */
+export const RENUDGE_COOLDOWN_MS = 60 * 60 * 1000;
+
+export type ConfirmDecision = 'send' | 'remind' | 'skip-declined' | 'skip-nothing-new' | 'skip-cooldown';
+
+/**
+ * Pure decision for "should Brady be emailed about this booking right now?".
+ * Split out from the I/O so every branch is testable without a live thread.
+ */
+export function decideConfirmAction(input: {
+  declined: boolean;
+  alreadyAsked: boolean;
+  /** Epoch ms of the last confirm email; 0/undefined = never asked. */
+  askedAt: number;
+  /** Epoch ms of the newest guest message, or null if the guest never wrote. */
+  latestGuestMs: number | null;
+  now: number;
+}): ConfirmDecision {
+  if (input.declined) return 'skip-declined';
+  if (!input.alreadyAsked) return 'send';
+  if (input.latestGuestMs === null || input.latestGuestMs <= input.askedAt) return 'skip-nothing-new';
+  if (input.now - input.askedAt < RENUDGE_COOLDOWN_MS) return 'skip-cooldown';
+  return 'remind';
+}
+
+/**
+ * Ask Brady to classify an ambiguous conversation — and ask AGAIN when the guest
+ * has said something new since the last ask.
+ *
+ * The old rule was "one email per reservation, ever", which went wrong on
+ * 2026-09-09: Vasiliki McDonough was already `pending` from a 9/2 "we would love
+ * the pool heated", so when she wrote "We want the pool. :)" — the actual yes,
+ * nine days before check-in — the system classified it `pending`, saw it had
+ * already asked, and said nothing. Nothing was scheduled and no one was told.
+ *
+ * A `pending` classification can never become `agreed` on its own (no offer
+ * template means no quoted price and no days to parse), so the confirm email is
+ * the ONLY path to heat. Sending it once and going quiet makes a missed click
+ * permanent.
+ *
+ * Guardrails: only a GUEST message re-opens the ask (Brady replying to his own
+ * guest must not email himself), never for a declined reservation, and at most
+ * one nudge an hour.
+ */
+async function requestConfirmation(
+  reservation: Reservation,
+  property: PropertyConfig,
+  messages: NormalisedMessage[]
+): Promise<void> {
+  const askedAt = confirmAskedAt.get(reservation.id) ?? 0;
+  const decision = decideConfirmAction({
+    declined: declinedReservations.has(reservation.id),
+    alreadyAsked: pendingConfirms.has(reservation.id),
+    askedAt,
+    latestGuestMs: latestGuestMessageTime(messages),
+    now: Date.now(),
+  });
+
+  if (decision === 'skip-cooldown') {
+    console.log(`[Confirm] ${reservation.guestName} (${reservation.id}) has new guest activity but was emailed <1h ago — holding.`);
+    return;
+  }
+  if (decision !== 'send' && decision !== 'remind') return;
+  const reminder = decision === 'remind';
+
+  try {
+    await sendConfirmRequest(reservation, property, { reminder, since: askedAt || undefined, messages });
+    pendingConfirms.add(reservation.id);
+    confirmAskedAt.set(reservation.id, Date.now());
+    persistConfirmState();
+  } catch (err: any) {
+    console.error(`[Confirm] Failed to send ${reminder ? 'reminder' : 'request'} for ${reservation.id}: ${err.message}`);
+  }
 }
 
 /**
@@ -1129,7 +1259,7 @@ export async function scanReservations() {
         continue;
       }
 
-      const heatResult = await checkReservationHeat(res);
+      const { result: heatResult, messages } = await checkReservationHeat(res);
       if (heatResult.status === 'agreed' && declinedReservations.has(res.id)) {
         // A human/explicit decline always wins over an 'agreed' classification.
         // Guards against a parser false-positive re-scheduling heat after a NO.
@@ -1137,17 +1267,10 @@ export async function scanReservations() {
       } else if (heatResult.status === 'agreed') {
         await scheduleForReservation(res, property, heatResult);
       } else if (heatResult.status === 'pending') {
-        // Host sent the offer, guest replied, but we can't classify.
-        // Email Brady with YES/NO links. Skip if we already asked or he said NO.
-        if (!pendingConfirms.has(res.id) && !declinedReservations.has(res.id)) {
-          try {
-            await sendConfirmRequest(res, property);
-            pendingConfirms.add(res.id);
-            persistConfirmState();
-          } catch (err: any) {
-            console.error(`[Confirm] Failed to send request for ${res.id}: ${err.message}`);
-          }
-        }
+        // Guest raised heat (or replied to the offer) but we can't classify.
+        // Email Brady with YES/NO links — and re-ask if the guest has spoken
+        // since the last email.
+        await requestConfirmation(res, property, messages);
       }
     }
 
@@ -1185,7 +1308,7 @@ export async function handleReservationWebhook(reservation: Reservation) {
     return;
   }
 
-  const heatResult = await checkReservationHeat(reservation);
+  const { result: heatResult } = await checkReservationHeat(reservation);
   if (heatResult.status === 'agreed' && declinedReservations.has(reservation.id)) {
     console.log(`[Webhook] ${reservation.guestName} (${reservation.id}) classified 'agreed' but is in declinedReservations — skipping.`);
   } else if (heatResult.status === 'agreed') {
@@ -1244,7 +1367,7 @@ export async function handleMessageWebhook(threadId: number, bookingId?: number)
     }
 
     // Scan messages for pool heat agreement
-    const heatResult = await checkReservationHeat(reservation);
+    const { result: heatResult, messages } = await checkReservationHeat(reservation);
     console.log(`[Message Webhook] Reservation ${reservationId} (${property.name}) — status: ${heatResult.status}`);
 
     if (heatResult.status === 'agreed' && declinedReservations.has(reservation.id)) {
@@ -1256,15 +1379,7 @@ export async function handleMessageWebhook(threadId: number, bookingId?: number)
         `Guest ${reservation.guestName} agreed to pool heat via message webhook (no polling delay).`
       );
     } else if (heatResult.status === 'pending') {
-      if (!pendingConfirms.has(reservation.id) && !declinedReservations.has(reservation.id)) {
-        try {
-          await sendConfirmRequest(reservation, property);
-          pendingConfirms.add(reservation.id);
-          persistConfirmState();
-        } catch (err: any) {
-          console.error(`[Confirm] Failed to send request for ${reservation.id}: ${err.message}`);
-        }
-      }
+      await requestConfirmation(reservation, property, messages);
     }
   } catch (err: any) {
     console.error(`[Message Webhook] Error processing conversation ${conversationId}: ${err.message}`);

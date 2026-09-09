@@ -3,6 +3,7 @@ import { Resend } from 'resend';
 import { config } from './config';
 import { PropertyConfig } from './config';
 import { Reservation, getConversationMessages } from './ownerrez';
+import { NormalisedMessage } from './detect';
 
 const resend = config.resend.apiKey ? new Resend(config.resend.apiKey) : null;
 
@@ -50,21 +51,45 @@ function buildLink(reservationId: number, answer: 'yes' | 'no' | 'undecided', he
   return publicUrl(`/confirm?t=${encodeURIComponent(token)}`);
 }
 
+export interface ConfirmRequestOptions {
+  /** True when Brady was already asked and the guest has replied since. */
+  reminder?: boolean;
+  /** Epoch ms of the previous ask — messages after it are flagged NEW. */
+  since?: number;
+  /** Already-fetched thread, to avoid a second round trip to OwnerRez. */
+  messages?: NormalisedMessage[];
+}
+
 /**
  * Email Brady with YES/NO links for an ambiguous pool-heat conversation.
+ *
+ * `reminder` re-sends it because the guest has spoken since the last ask (see
+ * requestConfirmation in scheduler.ts). The message is deliberately different —
+ * an identical email arriving twice reads as a duplicate and gets ignored,
+ * which is the exact failure this is meant to fix.
  */
-export async function sendConfirmRequest(reservation: Reservation, property: PropertyConfig): Promise<void> {
+export async function sendConfirmRequest(
+  reservation: Reservation,
+  property: PropertyConfig,
+  opts: ConfirmRequestOptions = {}
+): Promise<void> {
   if (!resend || !config.alerts.email) {
     console.error('[Confirm] Resend not configured — cannot send confirm email');
     return;
   }
 
-  const messages = await getConversationMessages(reservation.id, reservation.threadIds);
+  const { reminder = false, since } = opts;
+  const messages = opts.messages ?? await getConversationMessages(reservation.id, reservation.threadIds);
   const last6 = messages.slice(-6);
   const transcript = last6.map(m => {
     const who = m.isIncoming === 1 ? 'GUEST' : 'HOST';
     const body = (m.body || '').replace(/\n/g, ' ').slice(0, 300);
-    return `<div style="margin:8px 0"><b style="color:${who==='GUEST'?'#0369a1':'#475569'}">${who}:</b> ${escapeHtml(body)}</div>`;
+    const sentAt = parseUtcTimestamp(m.insertedOn);
+    const isNew = since !== undefined && who === 'GUEST' && sentAt !== null && sentAt > since;
+    const badge = isNew
+      ? ` <span style="background:#fef08a;color:#854d0e;font-size:11px;font-weight:600;padding:1px 5px;border-radius:3px">NEW</span>`
+      : '';
+    return `<div style="margin:8px 0${isNew ? ';background:#fefce8;border-left:3px solid #eab308;padding:6px 8px' : ''}"><b style="color:${who==='GUEST'?'#0369a1':'#475569'}">${who}:</b>${badge} ${escapeHtml(body)}</div>`;
   }).join('');
 
   const yesFull = buildLink(reservation.id, 'yes', null);
@@ -78,8 +103,10 @@ export async function sendConfirmRequest(reservation: Reservation, property: Pro
 
   const html = `
 <div style="font-family:system-ui,-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:20px;color:#0f172a">
-  <h2 style="margin:0 0 4px 0;color:#0f172a">Confirm pool heat?</h2>
-  <p style="color:#64748b;margin:0 0 16px 0">I couldn't automatically classify this conversation. Please confirm.</p>
+  <h2 style="margin:0 0 4px 0;color:#0f172a">${reminder ? 'Guest replied again — still needs your answer' : 'Confirm pool heat?'}</h2>
+  <p style="color:#64748b;margin:0 0 16px 0">${reminder
+    ? `The guest has written since I last asked you about this booking${since ? ` on ${new Date(since).toLocaleString('en-US', { timeZone: property.timezone, dateStyle: 'medium', timeStyle: 'short' })}` : ''}. New messages are highlighted below. <b>Nothing is scheduled until you answer.</b>`
+    : `I couldn't automatically classify this conversation. Please confirm.`}</p>
 
   <div style="background:#f1f5f9;border-radius:8px;padding:16px;margin-bottom:16px">
     <div><b>${escapeHtml(property.name)}</b></div>
@@ -103,13 +130,29 @@ export async function sendConfirmRequest(reservation: Reservation, property: Pro
   <p style="color:#94a3b8;font-size:12px;margin:0">Links expire in 14 days. Reservation ID ${reservation.id}.</p>
 </div>`;
 
+  const daysOut = daysBetween(new Date().toISOString().split('T')[0], reservation.arrivalDate);
+  const subject = reminder
+    ? `🔔 Guest replied — still awaiting your pool heat answer — ${property.name} — ${reservation.guestName} (check-in ${daysOut <= 0 ? 'TODAY' : `in ${daysOut}d`})`
+    : `❓ Confirm pool heat — ${property.name} — ${reservation.guestName} (${reservation.arrivalDate})`;
+
   await resend.emails.send({
     from: config.resend.fromAddress,
     to: config.alerts.email,
-    subject: `❓ Confirm pool heat — ${property.name} — ${reservation.guestName} (${reservation.arrivalDate})`,
+    subject,
     html,
   });
-  console.log(`[Confirm] Sent email for reservation ${reservation.id} (${reservation.guestName})`);
+  console.log(`[Confirm] Sent ${reminder ? 'REMINDER' : 'email'} for reservation ${reservation.id} (${reservation.guestName})`);
+}
+
+/**
+ * OwnerRez `date_utc` is UTC but not always `Z`-suffixed; a bare timestamp would
+ * parse as server-local. Same hazard as the 2026-04-09 four-hour offset bug.
+ */
+function parseUtcTimestamp(raw: string): number | null {
+  if (!raw) return null;
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(raw);
+  const ms = Date.parse(hasZone ? raw : `${raw}Z`);
+  return Number.isNaN(ms) ? null : ms;
 }
 
 function daysBetween(a: string, b: string): number {
