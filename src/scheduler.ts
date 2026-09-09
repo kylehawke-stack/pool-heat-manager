@@ -551,7 +551,13 @@ function parseUtcTimestamp(raw: string): number | null {
 /** At most one confirm email per reservation per hour, however chatty the guest. */
 export const RENUDGE_COOLDOWN_MS = 60 * 60 * 1000;
 
-export type ConfirmDecision = 'send' | 'remind' | 'skip-declined' | 'skip-nothing-new' | 'skip-cooldown';
+export type ConfirmDecision =
+  | 'send'
+  | 'remind'
+  | 'skip-declined'
+  | 'skip-scheduled'
+  | 'skip-nothing-new'
+  | 'skip-cooldown';
 
 /**
  * Pure decision for "should Brady be emailed about this booking right now?".
@@ -559,6 +565,8 @@ export type ConfirmDecision = 'send' | 'remind' | 'skip-declined' | 'skip-nothin
  */
 export function decideConfirmAction(input: {
   declined: boolean;
+  /** Heat is already on the calendar for this booking — the question is settled. */
+  scheduled: boolean;
   alreadyAsked: boolean;
   /** Epoch ms of the last confirm email; 0/undefined = never asked. */
   askedAt: number;
@@ -567,6 +575,12 @@ export function decideConfirmAction(input: {
   now: number;
 }): ConfirmDecision {
   if (input.declined) return 'skip-declined';
+  // A thread that reads `pending` reads `pending` forever — the offer template
+  // is never going to appear retroactively. Without this guard, clicking YES
+  // removed the booking from pendingConfirms and the very next scan asked
+  // again, and again every 4 hours. Seen live 2026-09-09 16:00 and 16:32 on
+  // Vasiliki McDonough, minutes after her heat was scheduled.
+  if (input.scheduled) return 'skip-scheduled';
   if (!input.alreadyAsked) return 'send';
   if (input.latestGuestMs === null || input.latestGuestMs <= input.askedAt) return 'skip-nothing-new';
   if (input.now - input.askedAt < RENUDGE_COOLDOWN_MS) return 'skip-cooldown';
@@ -600,12 +614,23 @@ async function requestConfirmation(
   const askedAt = confirmAskedAt.get(reservation.id) ?? 0;
   const decision = decideConfirmAction({
     declined: declinedReservations.has(reservation.id),
+    scheduled: scheduledEvents.some(e => e.reservationId === reservation.id),
     alreadyAsked: pendingConfirms.has(reservation.id),
     askedAt,
     latestGuestMs: latestGuestMessageTime(messages),
     now: Date.now(),
   });
 
+  if (decision === 'skip-scheduled') {
+    // Self-heal: a booking that got scheduled while sitting in the pending
+    // queue shouldn't stay there — it skews the digest and the SMS status.
+    if (pendingConfirms.delete(reservation.id)) {
+      confirmAskedAt.delete(reservation.id);
+      persistConfirmState();
+      console.log(`[Confirm] ${reservation.guestName} (${reservation.id}) is already scheduled — cleared from the pending queue.`);
+    }
+    return;
+  }
   if (decision === 'skip-cooldown') {
     console.log(`[Confirm] ${reservation.guestName} (${reservation.id}) has new guest activity but was emailed <1h ago — holding.`);
     return;
