@@ -17,12 +17,22 @@ interface ScheduledEvent {
   // SANITY_READ = pre-ON cold-pool check (panic-pull ON forward if pool is too
   // cold to reach target by check-in at conservative rate). Independent of
   // Open-Meteo, so it survives weather-API outages that could break RECALCULATE.
-  action: 'ON' | 'OFF' | 'RECALCULATE' | 'SANITY_READ';
+  // VERIFY = re-read the controller VERIFY_DELAY_MS after an ON/OFF. A readback
+  // at command time is not proof: on 2026-09-14 Elmwood read back HEATER, the
+  // email said SUCCESS, and the mode was OFF again within ~7 minutes.
+  action: 'ON' | 'OFF' | 'RECALCULATE' | 'SANITY_READ' | 'VERIFY';
   scheduledTime: Date;
   guestName: string;
   executed: boolean;
   targetTemp: number;
   heatDays?: number | null;
+  // VERIFY only: which command is being checked, when it ran (ISO — a later
+  // ON/OFF at the same property supersedes the check), which round this is,
+  // and whether the burner was already firing when the command was sent.
+  verifyOf?: 'ON' | 'OFF';
+  verifyActionTime?: string;
+  verifyRound?: number;
+  firingAtAction?: boolean;
   // Retry tracking — incremented on each handler attempt; if the handler throws
   // and attempts < MAX_EXECUTOR_ATTEMPTS the event stays unexecuted so the
   // next executor tick (every minute) re-fires it. Prevents transient API
@@ -1128,6 +1138,13 @@ async function executeScheduledEvents() {
       } catch (err: any) {
         console.error(`[Executor] SANITY_READ for ${event.guestName} (${property.name}) attempt ${event.attempts} threw: ${err.message}`);
       }
+    } else if (event.action === 'VERIFY') {
+      try {
+        await executeVerify(event, property, now);
+        succeeded = true;
+      } catch (err: any) {
+        console.error(`[Verify] ${event.verifyOf} for ${event.guestName} (${property.name}) attempt ${event.attempts} threw: ${err.message}`);
+      }
     } else {
       // ON/OFF: execute heater action (existing logic has its own setTimeout
       // retry for screenlogic transients; outer attempt counter guards against
@@ -1162,44 +1179,211 @@ async function executeScheduledEvents() {
  * via alertHeaterAction and do NOT throw — the existing in-process setTimeout
  * retry handles those without needing the outer cron-level retry.
  */
+const VERIFY_DELAY_MS = 10 * 60 * 1000;
+const VERIFY_MAX_ROUNDS = 3;
+const HEAT_MODE_OFF = 0;
+const HEAT_MODE_HEATER = 3;
+
+export type VerifyDecision =
+  | 'confirmed'        // controller holds the commanded state (ON: burner firing)
+  | 'at-temp'          // ON: mode held, heater idle because pool is already at set point
+  | 'recheck'          // ON: mode held, burner not firing yet — give it another round
+  | 'reapply'          // setting reverted — send the command again and re-verify
+  | 'fail-reverted'    // reverted on every round — manual action
+  | 'fail-not-firing'; // ON: mode held but burner never fired — propane/pump/ignition
+
+/**
+ * Pure decision for a VERIFY check. Exported for scripts/test-verify.ts.
+ */
+export function decideVerifyAction(input: {
+  verifyOf: 'ON' | 'OFF';
+  heatMode: number;
+  setPoint: number;
+  poolTemp: number;
+  firing: boolean;
+  targetTemp: number;
+  round: number;
+}): VerifyDecision {
+  const { verifyOf, heatMode, setPoint, poolTemp, firing, targetTemp, round } = input;
+  const lastRound = round >= VERIFY_MAX_ROUNDS;
+
+  if (verifyOf === 'OFF') {
+    if (heatMode === HEAT_MODE_OFF) return 'confirmed';
+    return lastRound ? 'fail-reverted' : 'reapply';
+  }
+
+  if (heatMode !== HEAT_MODE_HEATER || setPoint !== targetTemp) {
+    return lastRound ? 'fail-reverted' : 'reapply';
+  }
+  if (firing) return 'confirmed';
+  if (poolTemp > 0 && poolTemp >= setPoint) return 'at-temp';
+  // A gas heater can take a few minutes to light; one quiet re-check before alarming.
+  return round >= 2 ? 'fail-not-firing' : 'recheck';
+}
+
+/**
+ * Send an ON/OFF to the controller.
+ * IMPORTANT: update the schedule FIRST, then set the body. The Pentair
+ * controller periodically re-syncs the pool body's heat settings from the
+ * active schedule. If we set the body first, the controller can undo it
+ * before we update the schedule — leaving "schedule ON, body OFF".
+ */
+async function applyHeaterCommand(
+  property: PropertyConfig,
+  heaterAction: 'ON' | 'OFF',
+  targetTemp: number,
+  logPrefix = ''
+): Promise<{ success: boolean; message: string; firing?: boolean }> {
+  const gateway = property.screenlogicGateway!;
+  try {
+    const schedResult = heaterAction === 'ON'
+      ? await updatePoolScheduleHeatOn(gateway, targetTemp)
+      : await updatePoolScheduleHeatOff(gateway);
+    if (schedResult.success) {
+      console.log(`[Schedule] ${logPrefix}${schedResult.message}`);
+    } else {
+      console.error(`[Schedule] ${logPrefix}${schedResult.message}`);
+      await sendAlert('warning', `Schedule update failed — ${property.name}`, schedResult.message);
+    }
+  } catch (schedErr: any) {
+    console.error(`[Schedule] ${logPrefix}Error for ${property.name}: ${schedErr.message}`);
+    await sendAlert('warning', `Schedule update error — ${property.name}`, schedErr.message);
+  }
+
+  return heaterAction === 'ON'
+    ? await setPoolHeat(gateway, targetTemp)
+    : await turnOffPoolHeat(gateway);
+}
+
+function scheduleVerify(
+  event: ScheduledEvent,
+  heaterAction: 'ON' | 'OFF',
+  actionTime: Date,
+  round: number,
+  firingAtAction: boolean
+) {
+  addEvent({
+    reservationId: event.reservationId,
+    propertyName: event.propertyName,
+    action: 'VERIFY',
+    scheduledTime: new Date(Date.now() + VERIFY_DELAY_MS),
+    guestName: event.guestName,
+    executed: false,
+    targetTemp: event.targetTemp,
+    verifyOf: heaterAction,
+    verifyActionTime: actionTime.toISOString(),
+    verifyRound: round,
+    firingAtAction,
+  });
+}
+
+/**
+ * VERIFY handler: re-read the controller after an ON/OFF and act on what it
+ * actually shows. Throws only on read failure (outer executor retries).
+ */
+async function executeVerify(event: ScheduledEvent, property: PropertyConfig, now: Date) {
+  const verifyOf = event.verifyOf!;
+  const actionTime = new Date(event.verifyActionTime ?? event.scheduledTime);
+  const round = event.verifyRound ?? 1;
+
+  if (property.poolSystem !== 'screenlogic' || !property.screenlogicGateway) return;
+
+  // A later ON/OFF at this property (the guest's own OFF, or the next guest's
+  // ON on a turnover day) owns the heater now — this check is moot.
+  const superseded = scheduledEvents.find(e =>
+    e.propertyName === property.name &&
+    (e.action === 'ON' || e.action === 'OFF') &&
+    e.action !== verifyOf &&
+    e.scheduledTime > actionTime &&
+    (e.executed || e.scheduledTime <= now)
+  );
+  if (superseded) {
+    console.log(`[Verify] ${verifyOf} for ${event.guestName} (${property.name}) superseded by ${superseded.action} for ${superseded.guestName} — skipping`);
+    return;
+  }
+
+  const status = await getPoolStatus(property.screenlogicGateway);
+  const decision = decideVerifyAction({
+    verifyOf,
+    heatMode: status.poolHeatMode,
+    setPoint: status.poolSetPoint,
+    poolTemp: status.poolTemp,
+    firing: status.isPoolHeaterOn,
+    targetTemp: event.targetTemp,
+    round,
+  });
+  const reading = `heatMode=${status.poolHeatMode} setPoint=${status.poolSetPoint}°F burner=${status.isPoolHeaterOn ? 'FIRING' : 'off'} poolTemp=${status.poolTemp}°F`;
+  console.log(`[Verify] ${verifyOf} round ${round} for ${event.guestName} (${property.name}): ${reading} → ${decision}`);
+
+  switch (decision) {
+    case 'confirmed':
+      if (verifyOf === 'ON' && (!event.firingAtAction || round > 1)) {
+        await alertHeaterAction(property.name, 'ON', true, `Confirmed running — ${reading}`, event.guestName);
+      }
+      return;
+    case 'at-temp':
+      if (!event.firingAtAction || round > 1) {
+        await alertHeaterAction(property.name, 'ON', true,
+          `Heater set to ${event.targetTemp}°F and holding; burner idle because the pool is already at temperature — ${reading}`,
+          event.guestName);
+      }
+      return;
+    case 'recheck':
+      scheduleVerify(event, verifyOf, actionTime, round + 1, !!event.firingAtAction);
+      return;
+    case 'reapply': {
+      const result = await applyHeaterCommand(property, verifyOf, event.targetTemp, 'VERIFY re-apply: ');
+      await sendAlert('warning',
+        `Heater ${verifyOf} did not hold — re-applied — ${property.name}`,
+        [
+          `Property: ${property.name}`,
+          `Guest: ${event.guestName}`,
+          `The ${verifyOf} command was accepted at ${actionTime.toLocaleString('en-US', { timeZone: property.timezone })}, but the controller has since changed.`,
+          `Reading (round ${round}): ${reading}`,
+          `Re-applied: ${result.success ? 'OK' : 'FAILED'} — ${result.message}`,
+          `Checking again in 10 minutes.`,
+        ].join('\n'));
+      scheduleVerify(event, verifyOf, actionTime, round + 1, false);
+      return;
+    }
+    case 'fail-reverted':
+    case 'fail-not-firing':
+      await sendAlert('error',
+        `FAILED: Heater ${verifyOf} not holding — ${property.name} — MANUAL ACTION NEEDED`,
+        [
+          `Property: ${property.name}`,
+          `Guest: ${event.guestName}`,
+          decision === 'fail-reverted'
+            ? `The heater was set ${verifyOf} ${round} times and the controller changed it back each time. Something else is controlling it (Pentair app, another schedule, or the controller itself).`
+            : `Heat mode is set to HEATER at ${event.targetTemp}°F, but the burner has not fired after ${round * 10} minutes. Check the pump is running, the propane tank, and the heater for an error code.`,
+          `Reading: ${reading}`,
+          '',
+          '⚠️ Please check the heater in the Pentair app.',
+        ].join('\n'));
+      return;
+  }
+}
+
 async function executeHeaterAction(event: ScheduledEvent, property: PropertyConfig) {
   const heaterAction = event.action as 'ON' | 'OFF';
 
   if (property.poolSystem === 'screenlogic' && property.screenlogicGateway) {
     // Automated control.
-    // IMPORTANT: update the schedule FIRST, then set the body. The Pentair
-    // controller periodically re-syncs the pool body's heat settings from the
-    // active schedule. If we set the body first, the controller can undo it
-    // before we update the schedule — leaving "schedule ON, body OFF".
     try {
-      // Step 1: Update the Pentair controller's built-in schedule
-      try {
-        const schedResult = heaterAction === 'ON'
-          ? await updatePoolScheduleHeatOn(property.screenlogicGateway, event.targetTemp)
-          : await updatePoolScheduleHeatOff(property.screenlogicGateway);
-        if (schedResult.success) {
-          console.log(`[Schedule] ${schedResult.message}`);
-        } else {
-          console.error(`[Schedule] ${schedResult.message}`);
-          await sendAlert('warning', `Schedule update failed — ${property.name}`, schedResult.message);
-        }
-      } catch (schedErr: any) {
-        console.error(`[Schedule] Error for ${property.name}: ${schedErr.message}`);
-        await sendAlert('warning', `Schedule update error — ${property.name}`, schedErr.message);
-      }
-
-      // Step 2: Set pool body heat mode (now safe — schedule already agrees)
-      const result = heaterAction === 'ON'
-        ? await setPoolHeat(property.screenlogicGateway, event.targetTemp)
-        : await turnOffPoolHeat(property.screenlogicGateway);
+      const actionTime = new Date();
+      const result = await applyHeaterCommand(property, heaterAction, event.targetTemp);
 
       await alertHeaterAction(
         property.name,
         heaterAction,
         result.success,
         result.message,
-        event.guestName
+        event.guestName,
+        heaterAction === 'ON' && result.success && !result.firing
       );
+      if (result.success) {
+        scheduleVerify(event, heaterAction, actionTime, 1, !!result.firing);
+      }
 
       // If failed, retry once after 5 minutes (in-process; outer cron-level
       // retry separately re-fires events that throw — these are different
@@ -1207,30 +1391,20 @@ async function executeHeaterAction(event: ScheduledEvent, property: PropertyConf
       if (!result.success) {
         setTimeout(async () => {
           try {
-            try {
-              const schedRetry = heaterAction === 'ON'
-                ? await updatePoolScheduleHeatOn(property.screenlogicGateway!, event.targetTemp)
-                : await updatePoolScheduleHeatOff(property.screenlogicGateway!);
-              if (schedRetry.success) {
-                console.log(`[Schedule] RETRY: ${schedRetry.message}`);
-              } else {
-                console.error(`[Schedule] RETRY failed: ${schedRetry.message}`);
-              }
-            } catch (schedErr: any) {
-              console.error(`[Schedule] RETRY error: ${schedErr.message}`);
-            }
-
-            const retry = heaterAction === 'ON'
-              ? await setPoolHeat(property.screenlogicGateway!, event.targetTemp)
-              : await turnOffPoolHeat(property.screenlogicGateway!);
+            const retryTime = new Date();
+            const retry = await applyHeaterCommand(property, heaterAction, event.targetTemp, 'RETRY: ');
 
             await alertHeaterAction(
               property.name,
               heaterAction,
               retry.success,
               `RETRY: ${retry.message}`,
-              event.guestName
+              event.guestName,
+              heaterAction === 'ON' && retry.success && !retry.firing
             );
+            if (retry.success) {
+              scheduleVerify(event, heaterAction, retryTime, 1, !!retry.firing);
+            }
           } catch (err: any) {
             await alertHeaterAction(property.name, heaterAction, false, `RETRY FAILED: ${err.message}`, event.guestName);
           }

@@ -60,7 +60,7 @@ export async function setPoolHeat(
   gatewayName: string,
   targetTemp: number,
   password?: string
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; firing?: boolean }> {
   try {
     const client = await connectRemote(gatewayName, password);
 
@@ -76,6 +76,7 @@ export async function setPoolHeat(
         await client.closeAsync();
         return {
           success: true,
+          firing: true,
           message: `Heater already ON at ${targetTemp}°F — no changes needed. Pool temp: ${poolBody?.currentTemp ?? 'unknown'}°F`,
         };
       }
@@ -92,10 +93,16 @@ export async function setPoolHeat(
       const verifyHeatMode = verifyBody?.heatMode ?? 0;
 
       if (verifySetPoint === targetTemp && verifyHeatMode === HeatModes.HEAT_MODE_HEATER) {
-        const prefix = alreadyHeating ? 'Heater was already running — updated' : 'Heater ON';
+        // Mode + set point read back correctly, but that only proves the
+        // controller accepted the command. On 2026-09-14 (Elmwood) the mode
+        // reverted to OFF minutes later with no burner ever firing — the
+        // scheduler's VERIFY check is what confirms the heater actually runs.
+        const firing = (verifyBody?.heatStatus ?? 0) > 0;
+        const prefix = alreadyHeating ? 'Heater was already running — updated' : 'Heater command accepted';
         return {
           success: true,
-          message: `${prefix} — target ${targetTemp}°F, mode HEATER. Current pool temp: ${verifyBody?.currentTemp ?? 'unknown'}°F`,
+          firing,
+          message: `${prefix} — target ${targetTemp}°F, mode HEATER, burner ${firing ? 'FIRING' : 'not firing yet'}. Current pool temp: ${verifyBody?.currentTemp ?? 'unknown'}°F`,
         };
       } else {
         return {

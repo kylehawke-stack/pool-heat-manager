@@ -77,18 +77,24 @@ export async function alertHeaterAction(
   action: 'ON' | 'OFF',
   success: boolean,
   details: string,
-  guestName?: string
+  guestName?: string,
+  // true = the controller accepted the command but the heater is not yet
+  // confirmed running; a VERIFY check follows. Keeps the email from claiming
+  // "ON" on a readback alone (2026-09-14 Elmwood: SUCCESS email, cold pool).
+  verifying = false
 ) {
-  const level: AlertLevel = success ? 'success' : 'error';
-  const subject = success
-    ? `Heater ${action} — ${propertyName}`
-    : `FAILED: Heater ${action} — ${propertyName} — MANUAL ACTION NEEDED`;
+  const level: AlertLevel = success ? (verifying ? 'info' : 'success') : 'error';
+  const subject = !success
+    ? `FAILED: Heater ${action} — ${propertyName} — MANUAL ACTION NEEDED`
+    : verifying
+      ? `Heater ${action} command sent (verifying) — ${propertyName}`
+      : `Heater ${action} — ${propertyName}`;
 
   const body = [
     `Property: ${propertyName}`,
     guestName ? `Guest: ${guestName}` : '',
     `Action: Turn heater ${action}`,
-    `Status: ${success ? 'SUCCESS' : 'FAILED'}`,
+    `Status: ${!success ? 'FAILED' : verifying ? 'ACCEPTED — re-checking the controller in 10 minutes' : 'SUCCESS'}`,
     `Details: ${details}`,
     '',
     success ? '' : '⚠️ Please manually turn the heater on/off via the Pentair app.',

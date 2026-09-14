@@ -50,7 +50,7 @@ export async function buildDigestHtml(): Promise<string> {
     const statusBadge = renderStatus(scan.status, pendingConfirms.has(r.id), declinedReservations.has(r.id), events.length > 0);
     const timezoneOfProp = properties.find(p => p.ownerrezPropertyId === r.listingMapId)?.timezone || 'America/New_York';
     const isIntelliConnect = properties.find(p => p.ownerrezPropertyId === r.listingMapId)?.poolSystem === 'intelliconnect';
-    const eventsHtml = events.filter(e => e.action !== 'RECALCULATE').map(e =>
+    const eventsHtml = events.filter(e => e.action !== 'RECALCULATE' && e.action !== 'VERIFY').map(e =>
       `<div style="font-size:13px;color:${e.executed?'#94a3b8':'#0f172a'}">${e.action}: ${new Date(e.scheduledTime).toLocaleString('en-US', { timeZone: timezoneOfProp, weekday:'short', month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })}${e.executed?' <span style="color:#94a3b8">(done)</span>':''}</div>`
     ).join('') || '<div style="color:#94a3b8;font-size:13px">—</div>';
 
