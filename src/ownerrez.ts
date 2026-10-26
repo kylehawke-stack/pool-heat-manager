@@ -195,18 +195,22 @@ async function orzGet(pathname: string, params?: Record<string, string>, opts: G
   return res.json();
 }
 
-/** Walk a paged OwnerRez collection, returning every item. */
+/**
+ * Walk a paged OwnerRez collection, returning every item.
+ *
+ * Follows `next_page_url` exactly as returned. OwnerRez rejects `offset` > 0
+ * from 2027-01-05 (brownouts 2026-11-17 and 2026-12-01), and a cursor walk
+ * does not skip or repeat rows added mid-walk.
+ */
 async function orzGetAll(pathname: string, params: Record<string, string>, opts: GetOptions = {}): Promise<any[]> {
-  const limit = Number(params.limit || 50);
   const out: any[] = [];
-  let offset = 0;
+  let data = await orzGet(pathname, params, opts);
 
-  for (let page = 0; page < 50; page++) { // hard stop; 50 pages is far beyond this account
-    const data = await orzGet(pathname, { ...params, limit: String(limit), offset: String(offset) }, opts);
-    const items: any[] = data?.items || [];
-    out.push(...items);
-    if (items.length < limit) break;
-    offset += limit;
+  for (let page = 1; ; page++) {
+    out.push(...(data?.items || data?.messages || []));
+    const next: string | null = data?.next_page_url ?? null;
+    if (!next || page >= 50) break; // hard stop; 50 pages is far beyond this account
+    data = await orzGet(next, undefined, opts);
   }
 
   return out;
@@ -311,8 +315,8 @@ function mapMessage(m: any): NormalisedMessage {
 
 /** Fetch every message on one OwnerRez thread, oldest first. */
 export async function getThreadMessages(threadId: number): Promise<NormalisedMessage[]> {
-  const data = await orzGet('/v2/messages', { threadId: String(threadId) }, { requireOAuth: true });
-  const items: any[] = data?.items || data?.messages || [];
+  // Paged: a single GET returns only the first 20 messages of a long thread.
+  const items = await orzGetAll('/v2/messages', { threadId: String(threadId), limit: '100' }, { requireOAuth: true });
   return items
     .filter(m => !m.is_draft && !m.removed_utc)
     .map(mapMessage);
